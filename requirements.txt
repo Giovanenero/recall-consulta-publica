@@ -1,0 +1,10 @@
+# Robôs de consulta pública (TJAL, TJBA, TJRN). Versões testadas em 28/09/2026 com Python 3.14 no Windows.
+psycopg2-binary==2.9.12        # Postgres (todos)
+python-dotenv==1.2.3           # .env da raiz (todos)
+requests==2.34.2               # SAPRE e e-SAJ (TJAL), DJEN (TJBA)
+beautifulsoup4==4.15.0         # HTML do e-SAJ (TJAL)
+playwright==1.62.0             # Chrome instalado (TJBA por CDP, TJRN com perfil persistente)
+opencv-python-headless==5.0.0.93  # captcha Tencent do PJe (TJBA)
+numpy==2.5.3                   # imagens do captcha (TJBA)
+scrapling==0.4.15              # texto do detalhe do PJe (TJRN)
+# patchright                   # opcional no TJBA: se instalado, é usado no lugar do playwright

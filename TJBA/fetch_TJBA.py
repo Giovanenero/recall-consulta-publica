@@ -26,9 +26,9 @@ PROXY_* do .env, porque o DJEN limita por IP) e os seus arquivos (o worker 1 com
 _w<N>). Só o worker 1 assume a fila do RPA. Deadlock entre as gravações de dois workers devolve o crédito para a
 fila (ADIADO), não vira FALHA.
 
-Saídas em TJBA/saida: fetch_TJBA.csv (1 linha por crédito), fetch_credores_trocados.csv, fetch_legado_backup.csv,
-desfazer_legado_*.sql, desfazer_fila_*.sql (todos com _w<N> nos workers 2 em diante) e o HTML de cada detalhe
-aberto no PJe (pje1g_html/).
+Saídas em TJBA/saida, só na execução real (o resultado de cada crédito fica no banco e no log):
+desfazer_legado_<rodada>.sql (desfaz o que mudou nas tabelas antigas) e desfazer_fila_<rodada>.sql (devolve ao RPA a
+fila que o worker 1 assumiu), com _w<N> nos workers 2 em diante. A simulação não grava arquivo (tudo tem ROLLBACK).
 
 Uso:
     python fetch_TJBA.py --simulacao            # 20 créditos: faz tudo e desfaz no banco (ROLLBACK); não mexe na fila
@@ -43,7 +43,6 @@ import argparse
 import html as H
 import json
 import logging
-import msvcrt
 import os
 import random
 import re
@@ -77,15 +76,14 @@ if str(AQUI.parent) not in sys.path:
     sys.path.insert(0, str(AQUI.parent))            # utils/ fica na raiz do projeto
 
 from utils import banco  # noqa: E402
-from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
+from utils import workers  # noqa: E402
 
 # =============================================================================== configuração
 
 SAIDA = AQUI / "saida"
-PASTA_HTML = SAIDA / "pje1g_html"
 PERFIL = AQUI / ".chrome-profile-pje-tjba"
 load_dotenv(AQUI.parent / ".env")      # PG_HOST, PG_PORT, PG_DATABASE, PG_USER, PG_PASSWORD e PROXY_*
 log = logging.getLogger("fetch_TJBA")
@@ -175,12 +173,6 @@ JS_IFRAME_VISIVEL = ("() => { const f = document.getElementById('tcaptcha_iframe
 PAPEL_LEGADO = {"ATIVO": "REQUERENTE", "PASSIVO": "REQUERIDO"}    # como o RPA grava a capa antiga
 POLO_BRUTO = {"ATIVO": "AUTOR", "PASSIVO": "REU"}
 
-COLUNAS = ["processado_em", "modo", "credito_id", "precatorio", "beneficiario", "ente", "ultimo_status", "resultado",
-           "motivo", "originario", "regra", "fontes", "credor", "credor_documento", "candidatos", "capa_fonte",
-           "banco", "legado", "credores_antes", "credores_depois", "segundos"]
-COLUNAS_TROCAS = ["processado_em", "modo", "credito_id", "precatorio", "credores_antes", "credores_depois",
-                  "saiu", "entrou"]
-COLUNAS_BACKUP = ["rodada", "modo", "credito_id", "op", "tabela", "chave", "antes"]
 SEM_GRAVACAO = {"banco": "", "legado": "", "antes": set(), "depois": set()}
 
 
@@ -541,6 +533,9 @@ class Pje:
         """Abre o Chrome no perfil do worker, conecta por CDP e passa a guardar as imagens do captcha.
         A janela não é desacelerada quando fica atrás das dos outros workers (senão o captcha atrasa)."""
         PERFIL.mkdir(parents=True, exist_ok=True)
+        if orfaos := workers.matar_chrome_do_perfil(PERFIL):
+            log.warning(f"Chrome de uma execução anterior ainda aberto com o perfil {PERFIL.name}: fechado "
+                        f"({orfaos} processo(s))")
         for nome in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             try:
                 (PERFIL / nome).unlink(missing_ok=True)   # sem isso o Chrome recusa um perfil que não fechou direito
@@ -632,19 +627,16 @@ class Pje:
             try:
                 det.goto(urljoin(BASE, achou.group(1)), wait_until="domcontentloaded", timeout=60000)
                 self.esperar(det, lambda h: "processoPartesPoloAtivo" in h or "Polo ativo" in h)
-                return self.ler_detalhe(det, numero20)
+                return self.ler_detalhe(det)
             finally:
                 det.close()
         except ErroNavegador as e:
             raise ErroTecnico(f"PROCESSO_NAO_CARREGOU: {str(e).splitlines()[0][:150]}") from e
 
     @staticmethod
-    def ler_detalhe(det, numero20):
-        """Capa e partes do detalhe aberto, virando as páginas das tabelas de polo ativo e passivo.
-        Guarda o HTML da 1ª página em saida/pje1g_html/<cnj>.html."""
+    def ler_detalhe(det):
+        """Capa e partes do detalhe aberto, virando as páginas das tabelas de polo ativo e passivo."""
         html = det.content()
-        PASTA_HTML.mkdir(parents=True, exist_ok=True)
-        (PASTA_HTML / f"{numero20}.html").write_text(html, encoding="utf-8")
         partes, completa = partes_da_pagina(html), True
         for tabela in ("processoPartesPoloAtivoResumido", "processoPartesPoloPassivoResumido"):
             celulas = f"[id*='{tabela}'] td.rich-datascr-inact"
@@ -913,14 +905,14 @@ class Backup:
     entra (e linha criada pelo robô só é apagada), então o SQL pode rodar em qualquer ordem.
     Dois níveis: o crédito em gravação (p_*) e o que já teve COMMIT."""
 
-    def __init__(self, arquivo_sql, arquivo_csv, rodada, modo):
-        self.arquivo_sql, self.arquivo_csv, self.rodada, self.modo = arquivo_sql, arquivo_csv, rodada, modo
+    def __init__(self, arquivo_sql):
+        self.arquivo_sql = arquivo_sql
         self.tocados, self.inseridos = set(), set()
         self.descartar()
 
     def descartar(self):
         """Esquece o crédito em gravação (ROLLBACK)."""
-        self.p_tocados, self.p_inseridos, self.p_sql, self.p_csv = set(), set(), [], []
+        self.p_tocados, self.p_inseridos, self.p_sql = set(), set(), []
 
     def _ja_tocada(self, chave):
         """A linha já teve o 'antes' guardado (nesta rodada ou no crédito)?"""
@@ -939,13 +931,11 @@ class Backup:
         onde = " AND ".join(f"{c} = %s" for c in chave)
         self.p_sql.append(cur.mogrify(f"UPDATE {tabela} SET {', '.join(f'{c} = %s' for c in antes)} WHERE {onde};",
                                       [*antes.values(), *chave.values()]).decode())
-        self.p_csv.append(("UPDATE", tabela, chave, antes))
 
     def insert(self, cur, tabela, id_):
         """Guarda o DELETE da linha que o robô criou."""
         self.p_inseridos.add((tabela, id_))
         self.p_sql.append(cur.mogrify(f"DELETE FROM {tabela} WHERE id = %s;", [id_]).decode())
-        self.p_csv.append(("INSERT", tabela, {"id": id_}, {}))
 
     def delete(self, cur, tabela, linha):
         """Guarda o INSERT que recria a linha apagada."""
@@ -955,23 +945,18 @@ class Backup:
         self.p_sql.append(cur.mogrify(f"INSERT INTO {tabela} ({', '.join(colunas)}) VALUES "
                                       f"({', '.join(['%s'] * len(colunas))}) ON CONFLICT DO NOTHING;",
                                       list(linha.values())).decode())
-        self.p_csv.append(("DELETE", tabela, {"id": linha["id"]}, linha))
 
-    def confirmar(self, credito_id, manter):
-        """Depois do COMMIT (ou do ROLLBACK da simulação): escreve o SQL e o CSV do crédito;
-        manter=False (simulação) não lembra as linhas tocadas."""
-        if self.p_sql:
+    def confirmar(self, credito_id, gravado):
+        """Depois do COMMIT (gravado=True): escreve o SQL que desfaz o crédito e lembra as linhas tocadas. Depois do
+        ROLLBACK da simulação (gravado=False) não há o que desfazer: só esquece."""
+        if gravado and self.p_sql:
             novo = not self.arquivo_sql.exists()
             with open(self.arquivo_sql, "a", encoding="utf-8") as f:
                 if novo:
                     f.write("-- Desfaz as mudanças do fetch_TJBA.py nas tabelas antigas "
                             "(pode rodar em qualquer ordem).\n")
                 f.write(f"-- crédito {credito_id}\nBEGIN;\n" + "\n".join(reversed(self.p_sql)) + "\nCOMMIT;\n")
-            anexar_csv(self.arquivo_csv, COLUNAS_BACKUP,
-                       [{"rodada": self.rodada, "modo": self.modo, "credito_id": credito_id, "op": op, "tabela": t,
-                         "chave": json.dumps(ch, default=str), "antes": json.dumps(a, default=str, ensure_ascii=False)}
-                        for op, t, ch, a in self.p_csv])
-        if manter:
+        if gravado:
             self.tocados |= self.p_tocados
             self.inseridos |= self.p_inseridos
         self.descartar()
@@ -1292,40 +1277,28 @@ def gravar_credito(rod, item):
         log.warning(f"{lead['credito_id']}: gravação desfeita ({erro})", exc_info=not isinstance(e, psycopg2.Error))
     else:
         # fora do try: o crédito já teve COMMIT, então um erro aqui (disco) não pode virar FALHA na fila
-        rod.bk.confirmar(lead["credito_id"], manter=not rod.simulacao)
+        rod.bk.confirmar(lead["credito_id"], gravado=not rod.simulacao)
         return True
     item["gravado"] = SEM_GRAVACAO
     return False
 
 
 def registrar_credito(rod, item, gravou):
-    """Depois da gravação: completa e escreve a linha do CSV, os credores trocados e o resultado no log.
+    """Depois da gravação: o resultado no log (o detalhe completo fica no banco, em coleta_credor_tentativa.detalhe e
+    credito_fonte.metadata). Credor que saiu do crédito vai para o log como aviso.
     MAX_FALHAS_SEGUIDAS gravações seguidas em FALHA param o robô (banco com problema)."""
-    linha, lead, r, g = item["linha"], item["lead"], item["r"], item["gravado"]
-    saiu, entrou = g["antes"] - g["depois"], g["depois"] - g["antes"]
-    if saiu or entrou:
-        anexar_csv(rod.arq_trocas, COLUNAS_TROCAS,
-                   [{"processado_em": linha["processado_em"], "modo": rod.modo, "credito_id": lead["credito_id"],
-                     "precatorio": lead["precatorio"], "credores_antes": fmt_credores(g["antes"]),
-                     "credores_depois": fmt_credores(g["depois"]), "saiu": fmt_credores(saiu),
-                     "entrou": fmt_credores(entrou)}])
-    linha.update(resultado=r["status"], motivo=r["motivo"],
-                 originario=formatar_cnj(r["originario"]) if r["originario"] else "", regra=r["regra"],
-                 fontes=r["fontes"], credor=(r["credor"] or {}).get("nome", ""),
-                 credor_documento=(r["credor"] or {}).get("documento", ""),
-                 candidatos=" | ".join(f"{c['cnj']}[{','.join(c['fontes'])}{' forte' if c['forte'] else ''}"
-                                       f"{' ok' if c['confirmado'] else ''}{' ' + c['capa'] if c['capa'] else ''}]"
-                                       for c in r["candidatos"]),
-                 capa_fonte=";".join(f for _, f, _ in r["capas"]), banco=g["banco"], legado=g["legado"],
-                 credores_antes=fmt_credores(g["antes"]), credores_depois=fmt_credores(g["depois"]))
-    anexar_csv(rod.arq_credito, COLUNAS, [linha])
+    lead, r, g = item["lead"], item["r"], item["gravado"]
     rod.resultados[r["status"]] += 1
     rod.falhas_gravacao = 0 if gravou else rod.falhas_gravacao + (r["status"] == "FALHA")
     gravacao = ("ROLLBACK, simulação" if rod.simulacao else "COMMIT") if gravou else "não gravado"
+    motivo = "" if r["status"].startswith("SUCESSO") else f" ({r['motivo'].split(':')[0]})"
     log.log(logging.INFO if gravou else logging.WARNING,
-            f"[{rod.n}] {lead['credito_id']} {lead['precatorio']} -> {r['status']} "
+            f"[{rod.n}] {lead['credito_id']} {lead['precatorio']} -> {r['status']}{motivo} "
             f"{formatar_cnj(r['originario']) if r['originario'] else ''} "
-            f"{('CPF ' + r['credor']['documento']) if r['credor'] else ''} | {linha['segundos']} s | {gravacao}")
+            f"{('CPF ' + r['credor']['documento']) if r['credor'] else ''} | {item['segundos']} s | {gravacao}")
+    if saiu := g["antes"] - g["depois"]:
+        log.warning(f"{lead['credito_id']}: credor saiu do crédito: {fmt_credores(saiu)} "
+                    f"(ficou: {fmt_credores(g['depois']) or 'nenhum'})")
     if rod.falhas_gravacao >= MAX_FALHAS_SEGUIDAS:
         log.error(f"{MAX_FALHAS_SEGUIDAS} gravações seguidas em FALHA: robô parado (banco com problema?).")
         rod.parar = True
@@ -1335,7 +1308,7 @@ def registrar_credito(rod, item, gravou):
 
 def assumir_fila(con, id_software, rodada):
     """Passa para o robô as linhas do TJBA do RPA fora de lease; PENDENTE para quem não tem credor.
-    Guarda backup e o SQL que devolve tudo ao RPA."""
+    Guarda o SQL que devolve tudo ao RPA (com o status de antes)."""
     with con.cursor() as cur:
         cur.execute("""SELECT cc.credito_id, cc.status_id, cc.disponivel_em,
                               (c.saiu_da_lista_em IS NULL AND NOT EXISTS (
@@ -1355,9 +1328,6 @@ def assumir_fila(con, id_software, rodada):
                     (id_software, ids))
         cur.execute("UPDATE creditos.coleta_credor SET status_id = 1, disponivel_em = now() WHERE credito_id = ANY(%s)",
                     (pendentes,))
-        colunas = ["credito_id", "status_id", "disponivel_em", "sem_credor"]
-        anexar_csv(SAIDA / f"fetch_fila_backup_{rodada}.csv", colunas,
-                   [dict(zip(colunas, linha)) for linha in linhas])
         with open(SAIDA / f"desfazer_fila_{rodada}.sql", "a", encoding="utf-8") as f:
             f.write("-- Devolve ao RPA (software 2), com o status de antes, as linhas que o robô assumiu.\nBEGIN;\n")
             for i in range(0, len(linhas), 1000):
@@ -1414,21 +1384,17 @@ def amostra_simulacao(con, quantidade, worker):
 
 
 class Rodada:
-    """Estado de uma execução: modo, conexões, arquivos de saída, backup, DJEN, Chrome e contadores.
+    """Estado de uma execução: modo, conexões, backup do legado, DJEN, Chrome e contadores.
     Ao nascer prepara o banco (software, filas antigas, status do legado), a fila (amostra na simulação;
-    no modo real só o worker 1 roda assumir_fila) e abre o Chrome. Os arquivos levam o sufixo do worker."""
+    no modo real só o worker 1 roda assumir_fila) e abre o Chrome. Os SQL de desfazer levam o sufixo do worker."""
 
     def __init__(self, simulacao, limite):
         SAIDA.mkdir(exist_ok=True)
         self.simulacao, self.limite = simulacao, limite
         self.modo = "SIMULACAO" if simulacao else "REAL"
-        sufixo = sufixo_worker() + ("_simulacao" if simulacao else "")
         self.rodada = f"{datetime.now():%Y%m%d_%H%M%S}{sufixo_worker()}"
         self.assume_fila = not simulacao and WORKER_N == 1
-        self.arq_credito = SAIDA / f"fetch_TJBA{sufixo}.csv"
-        self.arq_trocas = SAIDA / f"fetch_credores_trocados{sufixo}.csv"
-        self.bk = Backup(SAIDA / f"desfazer_legado_{self.rodada}{'_simulacao' if simulacao else ''}.sql",
-                         SAIDA / f"fetch_legado_backup{sufixo}.csv", self.rodada, self.modo)
+        self.bk = Backup(SAIDA / f"desfazer_legado_{self.rodada}.sql")      # só é escrito na execução real
         self.resultados, self.falhas_seguidas, self.falhas_gravacao, self.n, self.parar = Counter(), 0, 0, 0, False
 
         self.con, self.con_l = conectar(escrita=True), conectar()
@@ -1480,26 +1446,21 @@ def proximo_credito(rod):
 
 def processar_credito(rod, credito_id):
     """Lê o crédito no banco e decide originário e credor (DJEN + PJe), sem gravar nada. Devolve o item a gravar
-    ({linha, lead, r}). Erro passageiro: devolve o crédito para a fila, escreve a linha ADIADO no CSV e devolve None;
+    ({lead, r, segundos}). Erro passageiro: devolve o crédito para a fila, registra ADIADO no log e devolve None;
     MAX_FALHAS_SEGUIDAS erros seguidos param o robô."""
     rod.n += 1
     inicio = time.time()
-    linha = {"processado_em": datetime.now().isoformat(timespec="seconds"), "modo": rod.modo, "credito_id": credito_id}
     try:
         with rod.con_l.cursor() as cur:
             lead = ler_credito(cur, credito_id)
-            linha.update(precatorio=lead["precatorio"], beneficiario=" | ".join(lead["beneficiarios"]),
-                         ente=lead["ente_lista"] or lead["ente_nome"], ultimo_status=lead["ultimo_status"])
             r = processar(cur, lead, rod.djen, rod.pje, inicio)
     except Exception as e:                              # erro passageiro (ou inesperado): volta para a fila
         tecnico = isinstance(e, ErroTecnico)
         motivo = str(e) if tecnico else \
             f"ERRO_DESCONHECIDO: {e.__class__.__name__}: {(str(e).splitlines() or [''])[0][:200]}"
         rod.falhas_seguidas += 1
-        linha.update(resultado="ADIADO", motivo=motivo, segundos=round(time.time() - inicio))
         if not rod.simulacao:
             devolver(rod.con, credito_id, motivo)
-        anexar_csv(rod.arq_credito, COLUNAS, [linha])
         rod.resultados["ADIADO"] += 1
         log.warning(f"[{rod.n}] {credito_id} -> ADIADO: {motivo}", exc_info=not tecnico)  # inesperado: traceback
         if re.search(r"closed|Target|browser", motivo, re.I):
@@ -1509,8 +1470,7 @@ def processar_credito(rod, credito_id):
             rod.parar = True
         return None
     rod.falhas_seguidas = 0
-    linha["segundos"] = round(time.time() - inicio)
-    return {"linha": linha, "lead": lead, "r": r}
+    return {"lead": lead, "r": r, "segundos": round(time.time() - inicio)}
 
 
 def encerrar(rod):
@@ -1521,22 +1481,6 @@ def encerrar(rod):
         rod.con.close()
         rod.con_l.close()
     log.info(f"{rod.modo}: {rod.n} crédito(s) | " + ", ".join(f"{k}: {v}" for k, v in rod.resultados.most_common()))
-    log.info(f"CSV: {rod.arq_credito}")
-
-
-def travar_worker(n):
-    """Trava exclusiva em saida/worker_<n>.lock enquanto o processo roda: um 2º processo com o mesmo --worker usaria
-    o mesmo perfil do Chrome e os mesmos arquivos, então para aqui. Devolve o arquivo aberto (a trava dura enquanto
-    ele estiver aberto, e o Windows a solta sozinho se o processo morrer)."""
-    SAIDA.mkdir(exist_ok=True)
-    trava = open(SAIDA / f"worker_{n}.lock", "a+")
-    trava.seek(0)
-    try:
-        msvcrt.locking(trava.fileno(), msvcrt.LK_NBLCK, 1)
-    except OSError:
-        trava.close()
-        raise SystemExit(f"o worker {n} já está rodando nesta máquina: use outro --worker.")
-    return trava
 
 
 def definir_worker(n):
@@ -1582,8 +1526,12 @@ def main():
     if args.workers:
         supervisionar(args)
         return
-    with travar_worker(args.worker):
-        rodar(args)
+    with workers.travar_worker(SAIDA, args.worker):     # saida/worker_<n>.lock: um processo por worker
+        try:
+            rodar(args)
+        except Exception:
+            log.exception("worker parou por erro inesperado")      # no log do worker, não só no terminal
+            raise
 
 
 def supervisionar(args):
@@ -1597,43 +1545,10 @@ def supervisionar(args):
         sup.warning(f"{args.workers} workers e {saidas_djen} saída(s) para o DJEN (direta + PROXY_*): do worker "
                     f"{saidas_djen + 1} em diante o DJEN sai direto e divide o limite por IP (fica mais lento)")
     extras = (["--simulacao"] if args.simulacao else []) + (["--limite", str(args.limite)] if args.limite else [])
-    workers = {}
-    try:
-        for n in range(1, args.workers + 1):
-            if n > 1:
-                time.sleep(PAUSA_ENTRE_WORKERS)
-            workers[n] = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--worker", str(n), *extras])
-            sup.info(f"worker {n} de {args.workers} subiu (pid {workers[n].pid})")
-        esperar_workers(sup, workers)
-    except KeyboardInterrupt:
-        sup.warning("Ctrl+C: cada worker devolve o crédito em andamento e encerra "
-                    "(Ctrl+C de novo mata os que faltarem)")
-        try:
-            esperar_workers(sup, workers)
-        except KeyboardInterrupt:
-            for n, processo in workers.items():
-                if processo.poll() is None:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(processo.pid)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    sup.error(f"worker {n} encerrado à força: o crédito dele volta para a fila quando o lease "
-                              f"expirar ({LEASE})")
-    sup.info("workers encerrados: " + ", ".join(f"{n}={p.poll()}" for n, p in workers.items())
-             + " (0 = saiu normal). Resultados nos CSVs e logs de cada worker em TJBA/saida.")
-
-
-def esperar_workers(sup, workers):
-    """Espera todos os workers saírem, registrando cada um que termina. Espera com timeout: no Windows, a espera sem
-    timeout não atende o Ctrl+C."""
-    avisados = set()
-    while True:
-        for n, processo in workers.items():
-            if processo.poll() is not None and n not in avisados:
-                avisados.add(n)
-                nivel = logging.INFO if processo.returncode == 0 else logging.WARNING
-                sup.log(nivel, f"worker {n} terminou (código {processo.returncode})")
-        if len(avisados) == len(workers):
-            return
-        time.sleep(1)
+    workers.supervisionar(sup, args.workers,
+                          lambda n: [sys.executable, str(Path(__file__).resolve()), "--worker", str(n), *extras],
+                          PAUSA_ENTRE_WORKERS,
+                          ao_forcar=f"o crédito dele volta para a fila quando o lease expirar ({LEASE})")
 
 
 def rodar(args):

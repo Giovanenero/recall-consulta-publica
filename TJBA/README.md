@@ -59,6 +59,12 @@ mesmo crédito; o resto é separado por worker:
   suba os workers aos poucos e acompanhe `CAPTCHA_REATIVADO` e `PESQUISA_SEM_RESPOSTA` no log.
 - `saida/worker_<N>.lock`: um 2º processo com o mesmo `--worker` é recusado na subida (usaria o mesmo perfil e os
   mesmos arquivos). O Windows solta a trava sozinho se o processo morrer.
+- Chrome que ficou aberto com o perfil do worker (worker anterior que caiu ou foi morto sem fechar o navegador) é
+  fechado na subida (`matar_chrome_do_perfil`, aviso no log): sem isso o Chrome novo entregava a janela para o
+  antigo, a porta de depuração não abria e o worker caía. A trava acima garante que o perfil não é de outro worker
+  vivo.
+- Worker que cai por erro inesperado registra o traceback no próprio log (`worker parou por erro inesperado`) e
+  sai com código 1; o supervisor mostra o código de cada worker no fim.
 - O Chrome sobe com `--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding` e
   `--disable-background-timer-throttling`: a janela atrás das outras não é desacelerada (senão o captcha atrasa).
 - Deadlock entre as gravações de dois workers (o mesmo originário em precatórios diferentes) desfaz a gravação do
@@ -75,7 +81,7 @@ mesmo crédito; o resto é separado por worker:
   `status_coleta.codigo` -> `codigo_legado` (ex.: `SUCESSO_PROCESSO_ORIGINARIO` -> `CREDOR_SUCESSO_atraves_originario`).
 - Modo real: `fila_credor_expirar_leases()` e **`assumir_fila`**: as linhas do TJBA em `coleta_credor` que eram do
   RPA (software 2) e não estão em lease passam para o robô; as sem credor ficam `PENDENTE`. Grava
-  `fetch_fila_backup_<rodada>.csv` e `desfazer_fila_<rodada>.sql` (devolve tudo ao RPA). Repete a cada 30 min.
+  `desfazer_fila_<rodada>.sql` (devolve tudo ao RPA, com o status de antes). Repete a cada 30 min.
 - `Pje.abrir()`: sobe o Chrome com `--remote-debugging-port` e conecta pelo Playwright (`connect_over_cdp`); guarda
   as imagens do captcha que passam pela rede.
 
@@ -112,7 +118,7 @@ Na ordem (forte, ligado, pista do RPA, DJEN), cada candidato é confirmado:
 2. pelo **PJe 1º grau** (`https://consultapublicapje.tjba.jus.br/pje/ConsultaPublica/listView.seam`, até 10 por
    crédito): digita o número, clica em Pesquisar, abre o detalhe, lê a capa (`campos_da_capa`: classe, assunto,
    jurisdição, órgão julgador, data) e as partes das tabelas de polo ativo e passivo, virando as páginas (até 50;
-   `completa = False` se passou disso). O HTML da 1ª página fica em `saida/pje1g_html/<cnj>.html`.
+   `completa = False` se passou disso). O HTML não é guardado em disco.
    - **Captcha Tencent** (slider): o robô baixa o fundo e a peça, acha o buraco com OpenCV (bordas Canny +
      `matchTemplate`) e arrasta o slider com aceleração, tremor e leve passada do ponto. Até 4 imagens por espera;
      depois disso `CAPTCHA_REATIVADO`.
@@ -132,7 +138,7 @@ Para quando o desempate prévio é confirmado. Passou de 15 min no crédito -> `
 | nenhum confirmado | `FALHA` / `PROCESSO_NAO_ENCONTRADO` | não |
 
 **Erro passageiro** (captcha, PJe/DJEN fora do ar, timeout, navegador caiu — `ErroTecnico`) ou inesperado: o crédito
-volta para a fila em 30 min (`fila_credor_adiar`), vira linha `ADIADO` no CSV e **nunca vira FALHA**. 5 falhas
+volta para a fila em 30 min (`fila_credor_adiar`), vira linha `ADIADO` no log e **nunca vira FALHA**. 5 falhas
 técnicas seguidas param o robô; navegador fechado -> reabre o Chrome.
 
 ### 5. Gravação do crédito (`gravar_credito` -> `gravar`)
@@ -164,12 +170,19 @@ traceback no log se não for erro do Postgres). A marcação na fila (`na_fila`)
 depois do ROLLBACK. Só depois do COMMIT o `Backup` escreve o SQL de desfazer do legado (fora do `try`: um erro de
 disco ali não vira FALHA de um crédito já gravado). 5 gravações seguidas em FALHA param o robô (banco com problema).
 
-### 6. Saídas (`TJBA/saida/`, sufixo `_w<N>` nos workers 2 em diante e `_simulacao` na simulação)
+### 6. Saídas (`TJBA/saida/`, sufixo `_w<N>` nos workers 2 em diante)
 
-`fetch_TJBA.csv` (1 linha por crédito: resultado, motivo, originário, regra, fontes, credor, candidatos, o que foi
-gravado, credores antes/depois), `fetch_credores_trocados.csv`, `fetch_legado_backup.csv`,
-`desfazer_legado_<rodada>.sql` (pode rodar em qualquer ordem), `fetch_fila_backup_<rodada>.csv`,
-`desfazer_fila_<rodada>.sql` e `pje1g_html/`.
+O resultado de cada crédito fica **no banco** (`coleta_credor_tentativa`: status, motivo e `detalhe` com regra,
+fontes, candidatos, partes e credores antes/depois; `credito_fonte.metadata`) e **no log**, uma linha por crédito:
+
+```
+2026-09-28 14:27:17 | INFO    | fetch_TJBA_w1 | [3] 900769 8004491-93.2023.8.05.0000 -> FALHA (PROCESSO_NAO_ENCONTRADO)   | 1 s | COMMIT
+2026-09-28 14:27:19 | INFO    | fetch_TJBA_w1 | [4] 921778 8045268-52.2025.8.05.0000 -> SUCESSO_PARTES_SEM_VALOR 0322231-47.2011.8.05.0001 CPF 05628083534 | 2 s | COMMIT
+```
+
+Credor que sai de um crédito vira `WARNING` no log. Em disco, só o que serve para desfazer, e só na execução real
+(a simulação dá ROLLBACK e não grava arquivo): `desfazer_legado_<rodada>.sql` (tabelas antigas, pode rodar em qualquer
+ordem) e `desfazer_fila_<rodada>.sql` (a tomada da fila do RPA pelo worker 1). Mais `logs/` e `worker_<N>.lock`.
 
 ## Tecnologias
 
@@ -204,5 +217,3 @@ gravado, credores antes/depois), `fetch_credores_trocados.csv`, `fetch_legado_ba
   número duas vezes é recusado).
 - Queda de conexão no meio da gravação desfaz só o crédito em andamento; se nem a devolução para a fila der certo,
   ele volta sozinho quando o lease (45 min) expira.
-- O `fetch_TJBA.csv` de antes desta mudança ainda tem a coluna `lote` no cabeçalho: as linhas novas seguem esse
-  cabeçalho com `lote` vazio (`anexar_csv` respeita o cabeçalho de um arquivo que já existe).

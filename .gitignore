@@ -1,0 +1,32 @@
+# credenciais (o modelo sem valores, .env.shared, vai para o repositório)
+.env
+.env.*
+!.env.shared
+
+# perfis do Chrome dos robôs (cookies e sessão dos portais)
+.chrome-profile*/
+
+# saídas dos robôs: CSVs, HTMLs e logs com CPF/CNPJ de credores
+saida/
+
+# logs (os dos robôs ficam em <TRIBUNAL>/saida/logs/; esta regra pega também log gravado fora de saida/)
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.venv/
+venv/
+
+# editor e ferramentas locais
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# temporários do Office e do Windows
+~$*
+Thumbs.db
+desktop.ini
