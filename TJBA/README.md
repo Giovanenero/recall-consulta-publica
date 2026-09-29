@@ -55,8 +55,10 @@ mesmo crédito; o resto é separado por worker:
 - O DJEN limita por IP (~1,3-2 consultas/s) e cada worker faz ~0,8/s: dois workers saindo direto ficam no limite.
   Por isso o worker N usa um proxy; os proxies precisam sair pelo Brasil (o DJEN bloqueia fora do país). Proxy que
   falha 3 vezes seguidas (conexão, 403/407) é desligado e o worker passa a sair direto (aviso no log).
-- O PJe continua saindo direto em todos os workers. Não se sabe se o PJe público limita ou endurece o captcha por IP:
-  suba os workers aos poucos e acompanhe `CAPTCHA_REATIVADO` e `PESQUISA_SEM_RESPOSTA` no log.
+- O PJe continua saindo direto em todos os workers (os proxies atuais não servem: pelo PJe dão 502). Em 29/09/2026 o
+  PJe do TJBA ficou instável para qualquer IP (pesquisas que não voltam, 502, tela "SISTEMA TEMPORARIAMENTE
+  INDISPONÍVEL"); os workers pausam juntos nesse caso (ver "PJe instável" abaixo). Suba os workers aos poucos (3 a 5)
+  e acompanhe `CAPTCHA_REATIVADO`, `PESQUISA_SEM_RESPOSTA` e `PJe instável` no log.
 - `saida/worker_<N>.lock`: um 2º processo com o mesmo `--worker` é recusado na subida (usaria o mesmo perfil e os
   mesmos arquivos). O Windows solta a trava sozinho se o processo morrer.
 - Chrome que ficou aberto com o perfil do worker (worker anterior que caiu ou foi morto sem fechar o navegador) é
@@ -139,7 +141,25 @@ Para quando o desempate prévio é confirmado. Passou de 15 min no crédito -> `
 
 **Erro passageiro** (captcha, PJe/DJEN fora do ar, timeout, navegador caiu — `ErroTecnico`) ou inesperado: o crédito
 volta para a fila em 30 min (`fila_credor_adiar`), vira linha `ADIADO` no log e **nunca vira FALHA**. 5 falhas
-técnicas seguidas param o robô; navegador fechado -> reabre o Chrome.
+técnicas seguidas (fora a instabilidade do PJe) param o robô; navegador fechado -> reabre o Chrome.
+
+**PJe instável** (`PjeInstavel`: `PESQUISA_SEM_RESPOSTA`, `PROCESSO_NAO_CARREGOU`, `PJE_INDISPONIVEL`). O PJe do TJBA
+às vezes trava pesquisas ao acaso (o captcha sai, a pesquisa não volta) ou mostra a tela "SISTEMA TEMPORARIAMENTE
+INDISPONÍVEL" / 502, para qualquer IP. O robô:
+
+1. reconhece a tela de indisponível e o HTTP 5xx na hora (`RE_PJE_FORA`, `Pje.conferir_no_ar`), sem esperar os 90 s;
+2. repete uma vez a pesquisa que não voltou (`Pje.consultar(tentativas=2)`: recarrega e pesquisa de novo), porque o
+   mesmo processo costuma abrir na vez seguinte; a tela de indisponível não é repetida;
+3. não conta isso como falha técnica: **3 créditos seguidos** com o PJe instável viram uma **pausa de todos os
+   workers da máquina**. O worker que viu vira o dono da pausa: grava `saida/pausa_pje.txt` (até quando), espera
+   10 min e testa o PJe com o processo-sonda `0510492-15.2019.8.05.0001` (duas pesquisas seguidas precisam abrir).
+   Voltou: apaga o arquivo, refaz a conexão com o banco se ela caiu e todos retomam. Não voltou: nova pausa de 20 min,
+   depois 30 min de novo e de novo, até somar 6 h — aí o worker para, como antes. Os outros workers veem o arquivo
+   antes de pegar o próximo crédito e esperam sem reservar nada (um arquivo largado por um dono que morreu vale só até
+   o fim marcado + 10 min). Ctrl+C durante a pausa sai normal e apaga a marcação.
+
+Nenhum crédito fica preso na pausa: ela acontece entre um crédito e outro, e os créditos em que o PJe falhou voltaram
+para a fila (`ADIADO`) como qualquer erro passageiro.
 
 ### 5. Gravação do crédito (`gravar_credito` -> `gravar`)
 
@@ -200,12 +220,13 @@ ordem) e `desfazer_fila_<rodada>.sql` (a tomada da fila do RPA pelo worker 1). M
 |---|---|
 | utilidades | `normal`, `chave_nome`, `nomes_para_buscar`, `chaves_ente`, `formatos_valor`, `valor_numerico`, `data_br`, `fmt_credores` |
 | DJEN | `proxies_do_env`, `saida_djen`, `Djen` (`buscar`, `por_nome`, `por_numero`), `candidatos_djen`, `oabs_do_precatorio` |
-| PJe | `localizar_chrome`, `porta_livre`, `esperar_cdp`, `partes_da_pagina`, `campos_da_capa`, `captcha_aberto`, `achar_buraco`, `arrastar_slider`, `Pje` (`abrir`, `fechar`, `reabrir`, `esperar`, `consultar`, `ler_detalhe`) |
+| PJe | `localizar_chrome`, `porta_livre`, `esperar_cdp`, `partes_da_pagina`, `campos_da_capa`, `captcha_aberto`, `achar_buraco`, `arrastar_slider`, `Pje` (`abrir`, `fechar`, `reabrir`, `conferir_no_ar`, `esperar`, `consultar`, `pesquisar`, `ler_detalhe`) |
 | banco: leitura | `conectar`, `SQL_CREDITO`, `ler_credito`, `pistas_do_rpa`, `credores_do_credito`, `confirmar` |
 | decisão | `processar` |
 | gravação de um crédito | `Backup`, `id_do_software`, `filas_antigas`, `partes_para_banco`, `capa_para_banco`, `travar_processo`, `gravar_capa_legado`, `atualizar_filas_mensais`, `registrar_metadata`, `gravar` |
 | gravação de cada crédito | `desfazer_transacao`, `na_fila`, `marcar_falha`, `adiar_por_conflito`, `gravar_credito`, `registrar_credito` |
 | fila | `assumir_fila`, `pegar`, `devolver`, `amostra_simulacao` |
+| pausa por PJe instável | `pausa_ate`, `marcar_pausa`, `tirar_pausa`, `pje_voltou`, `reconectar_banco`, `pausar_por_instabilidade`, `pausa_de_outro`, `esperar_pausa_de_outro` |
 | execução | `Rodada`, `proximo_credito`, `processar_credito`, `encerrar`, `travar_worker`, `definir_worker`, `sufixo_worker`, `ler_argumentos`, `main`, `rodar` |
 | vários workers num terminal | `supervisionar`, `esperar_workers` |
 

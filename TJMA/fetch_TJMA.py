@@ -4,9 +4,9 @@ lê o banco, acha o credor (DJEN), acha e confirma o originário (PJe 1º grau p
 lotes de LOTE créditos (LOTE_GRAVACAO_TJMA no .env). No lugar do modo credor do RPA_SISTEMAS (token A3 no PJe 2º grau).
 
 A lista do TJMA não traz o beneficiário (a Res. CNJ 303 veda) e o PJe 2º grau público não abre precatório, então:
-1. Fila: o robô tem software próprio (CONSULTA_PUBLICA_TJMA) na fila creditos.coleta_credor. assumir_fila() passa
-   para ele as linhas do TJMA que eram do RPA (fora de lease) e deixa PENDENTE quem não tem credor. Cada crédito é
-   reservado com fila_credor_pegar (lease) antes de raspar.
+1. Fila: ordem própria, não pagos primeiro (lista vigente e PDFs de pagos do hotsite do TJMA), e dentro de cada faixa
+   campanha, sem credor antes de com credor e maior valor. Cada crédito é reservado com lease (reservar) e só nessa
+   hora passa do RPA para o software próprio (CONSULTA_PUBLICA_TJMA); o que o RPA tinha fica em desfazer_fila_*.sql.
 2. DJEN pelo nº do precatório: o nome do credor (o texto traz 'CREDOR: E. S. D. A.' e os destinatários trazem o nome
    inteiro; as iniciais escolhem o destinatário certo), as OABs dos advogados e os CNJs de 1º grau citados no texto.
    Sem nenhuma publicação ainda (precatório novo): volta para a fila em ADIAMENTO_SEM_PUBLICACAO.
@@ -23,7 +23,7 @@ A lista do TJMA não traz o beneficiário (a Res. CNJ 303 veda) e o PJe 2º grau
    ele): originário, partes (registrar_capa), credor (registrar_credor), metadata (registrar_credito), capa antiga e
    filas mensais (legado) e o status na fila (fila_credor_finalizar).
 
-Rápido: TRABALHADORES threads raspam ao mesmo tempo (cada uma com a sua sessão do PJe e a sua conexão de leitura);
+Rápido: WORKERS threads raspam ao mesmo tempo (cada uma com a sua sessão do PJe e a sua conexão de leitura);
 só a thread principal pega da fila e grava. O DJEN tem um relógio por saída (direta e, com --proxies, PROXY_01..05
 do .env); os proxies precisam sair pelo Brasil (o DJEN bloqueia fora do país).
 
@@ -36,13 +36,14 @@ desfazer_legado_*.sql, desfazer_fila_*.sql e o HTML de cada detalhe aberto no PJ
 
 Uso:
     python fetch_TJMA.py --simulacao            # 20 créditos: faz tudo e desfaz no banco (ROLLBACK); não mexe na fila
-    python fetch_TJMA.py                        # assume a fila do TJMA e processa até acabar (Ctrl+C para parar)
+    python fetch_TJMA.py                        # processa a fila do TJMA até acabar (Ctrl+C para parar)
     python fetch_TJMA.py --limite 30            # para depois de 30 créditos
-    python fetch_TJMA.py --trabalhadores 8      # threads raspando ao mesmo tempo (padrão 6)
+    python fetch_TJMA.py --workers 12           # workers (threads) raspando ao mesmo tempo (padrão 6)
     python fetch_TJMA.py --proxies              # soma PROXY_01..05 como saídas extras do DJEN
 """
 import argparse
 import html as H
+import io
 import json
 import logging
 import os
@@ -55,9 +56,11 @@ import unicodedata
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urljoin
 
+import pdfplumber
 import psycopg2
 import psycopg2.errors
 import requests
@@ -77,6 +80,7 @@ from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
 SAIDA = AQUI / "saida"
 PASTA_HTML = SAIDA / "pje1g_html"
+PASTA_PDF = SAIDA / "pdf_tjma"          # números já extraídos de cada PDF do hotsite (o nome do arquivo muda a cada edição)
 load_dotenv(AQUI.parent / ".env")      # PG_*, LOTE_GRAVACAO_TJMA e (com --proxies) PROXY_01..05
 log = logging.getLogger("fetch_TJMA")
 
@@ -94,23 +98,31 @@ SOFTWARE = "CONSULTA_PUBLICA_TJMA"
 SOFTWARE_RPA = 2                       # RPA_CREDOR_V1
 WORKER = f"{socket.gethostname()}:TJMA:consulta_publica:{os.getpid()}"
 LOTE = lote_do_env()                   # créditos por transação de gravação
-TRABALHADORES = 6                      # threads raspando ao mesmo tempo (--trabalhadores)
+WORKERS = 6                            # workers (threads deste processo) raspando ao mesmo tempo (--workers)
 TETO_CREDITO = 5 * 60                  # s por crédito; passou disso, volta para a fila
 ADIAMENTO = "30 minutes"               # erro passageiro
 ADIAMENTO_SEM_PUBLICACAO = "15 days"   # precatório ainda sem publicação no DJEN
-ASSUMIR_A_CADA = 30 * 60               # s entre rodadas de assumir_fila
+REORDENAR_A_CADA = 30 * 60             # s entre remontagens da ordem da fila (entram os adiados que venceram)
 MAX_FALHAS_SEGUIDAS = 8                # falhas técnicas seguidas que param o robô
 AMOSTRA_SIMULACAO = 20
 FILA_ANTIGA_DESDE = "processos_unificados_2026_08"
 
 DJEN = "https://comunicaapi.pje.jus.br/api/v1/comunicacao"
-INTERVALO_DJEN = 1.0                   # s entre consultas por saída (sobe sozinho quando o DJEN devolve 429)
+INTERVALO_DJEN = 1.2                   # s entre consultas por saída (sobe sozinho quando o DJEN devolve 429)
+PAUSA_429 = 10                         # s que a saída fica parada depois de um 429 (o intervalo também sobe)
 INTERVALO_DJEN_MAX = 6.0
 FALHAS_PARA_DESLIGAR_PROXY = 3
 MAX_PAGINAS_DJEN_PRECATORIO = 3        # 100 publicações por página
 MAX_PAGINAS_DJEN_NOME = 5
 MAX_VALOR_DJEN = 5                     # candidatos confirmados que ganham 1 consulta no DJEN para o desempate por valor
 MAX_CACHE_DJEN = 5000
+
+HOTSITE = "https://www.tjma.jus.br/midia/prec/pagina/hotsite/500708"
+RE_PDF_LISTA = re.compile(r"estado_do_maranhao_administracao_direta_e_indireta_atualizada_ate_(\d{2})(\d{2})(\d{4})")
+RE_PDF_PAGOS = re.compile(r"pagos|processo_de_pagamento", re.I)
+# ordem da fila do robô: faixa menor primeiro (a prioridade de campanha vale dentro da faixa)
+FAIXAS = {1: "NAO_PAGO", 2: "SEM_INFO_PAGAMENTO", 3: "PAGO_PARCIAL"}
+FORA_DA_LISTA = "FORA_DA_LISTA_VIGENTE"   # grupo do Estado que não está na lista vigente: quitado ou retirado, não é pego
 
 BASE = "https://pje.tjma.jus.br"
 URL = BASE + "/pje/ConsultaPublica/listView.seam"
@@ -179,17 +191,19 @@ FIM_CAMPO = "|".join(ROTULOS.values()) + (r"|N[úu]mero\s+Processo|Endere[çc]o|
                                           r"|Valor\s+da\s+[Cc]ausa|Segredo|Justi[çc]a\s+[Gg]ratuita|Prioridade"
                                           r"|Tutela|Polo\s+[Aa]tivo|Polo\s+[Pp]assivo|Movimenta|Documentos")
 
+SEMELHANCA_MESMA_PESSOA = 0.9          # nomes com grafia próxima (SOUSA x SOUZA) contam como a mesma pessoa
 PAPEL_LEGADO = {"ATIVO": "REQUERENTE", "PASSIVO": "REQUERIDO"}    # como o RPA grava a capa antiga
 POLO_BRUTO = {"ATIVO": "AUTOR", "PASSIVO": "REU"}
 
-COLUNAS = ["processado_em", "modo", "credito_id", "precatorio", "credor_djen", "ente", "ultimo_status", "resultado",
+COLUNAS = ["processado_em", "modo", "credito_id", "precatorio", "pagamento", "caminho", "credor_djen", "ente", "ultimo_status",
+           "resultado",
            "motivo", "originario", "regra", "fontes", "credor", "credor_documento", "candidatos", "capa_fonte",
-           "publicacoes_djen", "oabs_precatorio", "cessao", "banco", "legado", "credores_antes", "credores_depois",
+           "publicacoes_djen", "oabs_precatorio", "cessao", "credor_corrigido", "coletiva", "banco", "legado", "credores_antes", "credores_depois",
            "lote", "segundos"]
 COLUNAS_TROCAS = ["processado_em", "modo", "credito_id", "precatorio", "credores_antes", "credores_depois",
                   "saiu", "entrou"]
 COLUNAS_BACKUP = ["rodada", "modo", "credito_id", "op", "tabela", "chave", "antes"]
-SEM_GRAVACAO = {"banco": "", "legado": "", "antes": set(), "depois": set()}
+SEM_GRAVACAO = {"banco": "", "legado": "", "antes": set(), "depois": set(), "corrigidos": [], "coletiva": 0}
 
 
 class ErroTecnico(Exception):
@@ -336,6 +350,7 @@ class Djen:
         self.trava = threading.Lock()
         self.cache = {}
         self.local = threading.local()
+        self.n_429 = 0
 
     def _sessao(self):
         if not getattr(self.local, "sessao", None):
@@ -389,8 +404,9 @@ class Djen:
                 return itens
             if r.status_code == 429:
                 with self.trava:
+                    self.n_429 += 1
                     s.intervalo = min(s.intervalo * 1.5, INTERVALO_DJEN_MAX)
-                    s.proxima = time.time() + 30
+                    s.proxima = time.time() + PAUSA_429
             elif r.status_code in (403, 407) and s.proxies:
                 self._falhou(s, f"HTTP {r.status_code}")
             else:
@@ -682,6 +698,92 @@ class Pje:
                 "partes": [p for p in unicas if not RE_ADVOGADO.search(p["papel"])],
                 "advogados": [p for p in unicas if RE_ADVOGADO.search(p["papel"])]}
 
+# =============================================================================== situação de pagamento (PDFs do hotsite)
+
+
+def numeros_do_pdf(url):
+    """Números CNJ (20 dígitos) de um PDF do hotsite de precatórios. Guarda o resultado em PASTA_PDF/<arquivo>.json:
+    cada edição sai com outro nome de arquivo, então o que já foi lido não é baixado de novo."""
+    cache = PASTA_PDF / (url.rsplit("/", 1)[-1] + ".json")
+    if cache.exists():
+        return set(json.loads(cache.read_text(encoding="utf-8")))
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=180)
+    r.raise_for_status()
+    with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+        texto = " ".join(p.extract_text() or "" for p in pdf.pages)
+    # qualquer CNJ: a lista do Estado também traz precatório de outro tribunal pago por ele (TRT22, TJTO...)
+    numeros = sorted({so_digitos(c) for c in CNJ.findall(texto)})
+    PASTA_PDF.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(numeros), encoding="utf-8")
+    return set(numeros)
+
+
+def pagamentos_tjma():
+    """Do hotsite do TJMA: a lista cronológica vigente do Estado (só pendentes) e os PDFs de 'Precatórios Pagos ou em
+    Processo de Pagamento'. {vigente, data_lista, pagos: {numero20: [arquivos]}}; None se o hotsite não responder
+    (aí a fila anda sem a ordem por pagamento)."""
+    try:
+        html = requests.get(HOTSITE, headers={"User-Agent": UA}, timeout=60).text
+        urls = sorted(set(re.findall(r'href="(https://novogerenciador\.tjma\.jus\.br/[^"]+\.pdf)"', html)))
+        listas = [(date(int(m[3]), int(m[2]), int(m[1])), u) for u in urls if (m := RE_PDF_LISTA.search(u))]
+        if not listas:
+            raise ValueError("lista cronológica do Estado não achada no hotsite")
+        data_lista, url_lista = max(listas)
+        inicio = time.time()
+        vigente = numeros_do_pdf(url_lista)
+        pagos = {}
+        for u in (u for u in urls if RE_PDF_PAGOS.search(u.rsplit("/", 1)[-1])):
+            for n in numeros_do_pdf(u):
+                pagos.setdefault(n, []).append(u.rsplit("/", 1)[-1][:90])
+    except Exception as e:
+        log.warning(f"situação de pagamento indisponível ({e.__class__.__name__}: {str(e)[:150]}): "
+                    "a fila anda sem a ordem por pagamento")
+        return None
+    log.info(f"pagamento: lista vigente de {data_lista:%d/%m/%Y} com {len(vigente)} precatórios; {len(pagos)} "
+             f"precatórios em PDFs de pagos ({time.time() - inicio:.0f}s)")
+    return {"vigente": vigente, "data_lista": data_lista, "pagos": pagos}
+
+
+SQL_ESCOPO = """
+SELECT cc.credito_id, left(c.numero_norm, 20) AS numero20, cc.prioridade, cc.valor_referencia,
+       coalesce((SELECT li.metadata->>'entidade_valor' FROM creditos.lista_item li
+                  WHERE li.credito_id = c.id AND li.removido_em IS NULL LIMIT 1), '') AS grupo,
+       EXISTS (SELECT 1 FROM creditos.credito_credor k WHERE k.credito_id = cc.credito_id AND k.papel_id <> 2) AS tem_credor
+  FROM creditos.coleta_credor cc JOIN creditos.credito c ON c.id = cc.credito_id
+ WHERE cc.tribunal_id = %s AND c.saiu_da_lista_em IS NULL AND cc.status_id <> 2 AND {filtro}
+"""
+
+
+def situacao_pagamento(linha, pag):
+    """Faixa da fila (1 não pago, 2 sem informação, 3 pago em parte) ou FORA_DA_LISTA, e os PDFs de pagos do crédito.
+    Só o grupo do Estado tem lista e pagos publicados no hotsite; os municípios ficam sem informação."""
+    if not pag:
+        return 1, []
+    arquivos = pag["pagos"].get(linha["numero20"], [])
+    if linha["grupo"] != "estado":
+        return (3 if arquivos else 2), arquivos
+    if linha["numero20"] not in pag["vigente"]:
+        return FORA_DA_LISTA, arquivos
+    return (3 if arquivos else 1), arquivos
+
+
+def ordenar_escopo(con, pag, filtro):
+    """(ids na ordem do robô, {credito_id: {faixa, situacao, arquivos}}, contagem por situação).
+    Ordem: faixa, prioridade de campanha, sem credor antes de com credor, maior valor, id."""
+    with con.cursor() as cur:
+        cur.execute(SQL_ESCOPO.format(filtro=filtro), (TRIBUNAL_TJMA,))
+        linhas = como_dicts(cur)
+    info, contagem = {}, Counter()
+    for x in linhas:
+        faixa, arquivos = situacao_pagamento(x, pag)
+        situacao = FAIXAS.get(faixa, FORA_DA_LISTA)
+        contagem[situacao] += 1
+        info[x["credito_id"]] = {"faixa": faixa, "situacao": situacao, "arquivos": arquivos[:5], "linha": x}
+    ordem = sorted((i for i, v in info.items() if v["faixa"] != FORA_DA_LISTA),
+                   key=lambda i: (info[i]["faixa"], info[i]["linha"]["prioridade"], info[i]["linha"]["tem_credor"],
+                                  -float(info[i]["linha"]["valor_referencia"] or 0), i))
+    return ordem, info, contagem
+
 # =============================================================================== banco: leitura
 
 
@@ -754,14 +856,28 @@ def credores_do_credito(cur, credito_id):
     return set(cur.fetchall())
 
 
-def confirmar(partes, alvo, lead):
-    """(credor, ente_ok): a parte do polo ativo com o nome do credor (a com documento válido primeiro)
-    e se o ente está no polo passivo."""
-    ativos = sorted((p for p in partes if p["polo"] == "ATIVO" and chave_nome(p["nome"]) in alvo),
-                    key=lambda p: not documento_valido(p["documento"]))
+def confirmar(partes, alvo, lead, iniciais_credor=(), unico_autor=False):
+    """(credor, ente_ok, como): a parte do polo ativo que é o credor e se o ente está no polo passivo.
+    O credor é achado pelo nome (a com documento válido primeiro); sem nome, pelas iniciais que o DJEN publicou
+    (só se uma pessoa bater); e, só quando permitido (originário já ligado ao crédito, sem nome nem iniciais),
+    quando o polo ativo tem um autor só. como = NOME | INICIAIS | UNICO_AUTOR."""
     ente_ok = not lead["chaves"] or any(ente_no_nome(p["nome"], lead["chaves"], lead["estadual"])
                                         for p in partes if p["polo"] == "PASSIVO")
-    return (ativos[0] if ativos else None), ente_ok
+    ativos = [p for p in partes if p["polo"] == "ATIVO" and not RE_ORGAO_PUBLICO.search(normal(p["nome"]))
+              and not ente_no_nome(p["nome"], lead["chaves"], lead["estadual"])]
+    por_nome = sorted((p for p in ativos if chave_nome(p["nome"]) in alvo),
+                      key=lambda p: not documento_valido(p["documento"]))
+    if por_nome:
+        return por_nome[0], ente_ok, "NOME"
+    if iniciais_credor:
+        por_iniciais = {chave_nome(p["nome"]): p for p in ativos if iniciais(p["nome"]) in iniciais_credor}
+        if len(por_iniciais) == 1:
+            return next(iter(por_iniciais.values())), ente_ok, "INICIAIS"
+    if unico_autor:
+        autores = {chave_nome(p["nome"]): p for p in ativos}
+        if len(autores) == 1:
+            return next(iter(autores.values())), ente_ok, "UNICO_AUTOR"
+    return None, ente_ok, ""
 
 # =============================================================================== decisão (só lê: banco, DJEN, PJe)
 
@@ -770,42 +886,43 @@ def resultado_vazio():
     """Resultado a gravar, antes de decidir."""
     return {"status": "FALHA", "motivo": "", "via": "NOME", "originario": None, "regra": "", "fontes": "",
             "credor": None, "capas": [], "candidatos": [], "capa_escolhida": None, "partes_escolhido": [],
-            "credor_djen": "", "publicacoes": 0, "oabs_precatorio": "", "cessao": False}
+            "credor_djen": "", "publicacoes": 0, "oabs_precatorio": "", "cessao": False, "caminho": ""}
 
 
 def processar(cur, lead, djen, pje, inicio):
-    """Acha o credor, acha e confirma o originário. Devolve o resultado a gravar (status ADIAR = volta para a fila)."""
+    """Acha o credor e o originário. Com originário conhecido (ligado no banco, citado no DJEN ou pista do RPA), abre
+    ele direto pelo número; só se nenhum confirmar é que pesquisa o nome do credor no PJe. Devolve o resultado a gravar
+    (status ADIAR = volta para a fila)."""
     r = resultado_vazio()
     prec20 = lead["precatorio20"]
+    if prec20[13:16] != "810":
+        # precatório de outro tribunal (TRT, TJ de outro estado) na lista do Maranhão: nem o DJEN do TJMA nem o PJe
+        # do TJMA o têm
+        r["motivo"] = f"CREDITO_ORIGINADO_EM_TRIBUNAL_DISTINTO: {formatar_cnj(prec20)} não é do TJMA"
+        return r
 
     def tempo():
         if time.time() - inicio > TETO_CREDITO:
             raise ErroTecnico(f"TIMEOUT_PAGINA_PROCESSO: passou de {TETO_CREDITO // 60} min no crédito")
 
-    # 1. DJEN do precatório: quem é o credor
+    # 1. DJEN do precatório: quem é o credor (nome inteiro, ou só as iniciais), OABs e CNJs citados
     info = credor_do_djen(djen.do_precatorio(prec20), lead["chaves"], lead["estadual"])
     r.update(publicacoes=info["publicacoes"], oabs_precatorio=",".join(sorted(info["oabs"])), cessao=info["cessao"],
              credor_djen=" | ".join(info["nomes"]))
-    if not info["publicacoes"]:
-        r.update(status="ADIAR", motivo="AINDA_SEM_PUBLICACAO: precatório sem publicação no DJEN")
-        return r
-    if not info["nomes"]:
-        r["motivo"] = f"SEM_BENEFICIARIO: credor não identificado nas {info['publicacoes']} publicações do DJEN " \
-                      f"(rótulos: {', '.join(info['rotulos'])[:200] or 'nenhum'})"
-        return r
-    if all(RE_ORGAO_PUBLICO.search(normal(n)) for n in info["nomes"]):
-        r["motivo"] = f"REQTE_ORGAO_PUBLICO: {info['nomes'][0]}"
-        return r
-    if all(RE_SOCIEDADE_ADV.search(normal(n)) for n in info["nomes"]):
-        r["motivo"] = f"SEM_CPF_CREDOR: credor é sociedade de advogados (honorários): {info['nomes'][0]}"
-        return r
     nomes = []
     for c in info["nomes"][:2]:
         nomes += [n for n in nomes_para_buscar(c) if chave_nome(n) not in {chave_nome(x) for x in nomes}]
     alvo = {chave_nome(n) for n in nomes}
+    # sem nome, as iniciais do rótulo 'CREDOR: M. J. D. P.' ainda acham o credor dentro de um originário conhecido
+    iniciais_credor = set() if nomes else {iniciais(v) for v in info["rotulos"] if eh_iniciais(v)}
+    if nomes and all(RE_ORGAO_PUBLICO.search(normal(n)) for n in nomes):
+        r["motivo"] = f"REQTE_ORGAO_PUBLICO: {nomes[0]}"
+        return r
+    if nomes and all(RE_SOCIEDADE_ADV.search(normal(n)) for n in nomes):
+        r["motivo"] = f"SEM_CPF_CREDOR: credor é sociedade de advogados (honorários): {nomes[0]}"
+        return r
 
-    # 2. candidatos: já ligado, pista do RPA, CNJ citado no DJEN (fortes) e a pesquisa pelo nome no PJe
-    cands = {}
+    cands, abertos = {}, [0]
 
     def somar(n, fonte, forte=False, linha=None, classe=""):
         """Junta um candidato (de qualquer fonte) em cands, somando fontes e evidência forte."""
@@ -828,6 +945,49 @@ def processar(cur, lead, djen, pje, inicio):
         return "DJEN_CITA" if "DJEN_CITA" in f else "VALOR" if cands[n]["valor"] else \
             "LIGADO" if "LIGADO" in f else "RPA_OK"
 
+    def abrir(n):
+        """Confirma um candidato: pelas partes que o banco já tem ou abrindo o detalhe no PJe (até MAX_ABERTOS_PJE)."""
+        tempo()
+        c = cands[n]
+        c["aberto"] = True
+        unico = not nomes and not iniciais_credor and "LIGADO" in c["fontes"]
+        existentes = partes_do_banco(cur, formatar_cnj(n))
+        partes_bd = [{"nome": e["nome"], "documento": e["documento"] or "", "polo": e["polo"]}
+                     for e in existentes if e["papel"] != "ADVOGADO"]
+        credor, ente_ok, como = confirmar(partes_bd, alvo, lead, iniciais_credor, unico)
+        if credor and ente_ok and documento_valido(credor["documento"]):
+            c.update(confirmado=True, capa="BANCO", partes=partes_bd, como=como,
+                     credor={"nome": credor["nome"], "documento": so_digitos(credor["documento"])})
+            c["oabs"] |= {f"{e['oab_numero']}{e['oab_uf']}" for e in existentes
+                          if e["papel"] == "ADVOGADO" and e["polo"] == "ATIVO" and e["oab_numero"]}
+            return
+        if abertos[0] >= MAX_ABERTOS_PJE:
+            c["pje"] = "NAO_ABERTO"
+            return
+        abertos[0] += 1
+        linha = c["linha"] or pje.por_numero(n)
+        if not linha:
+            c["pje"] = "NAO_ENCONTRADO"
+            return
+        dados = pje.detalhe(linha["link"], n, alvo, prazo=inicio + TETO_CREDITO - 15)
+        time.sleep(PAUSA_PJE)
+        c["pje"] = "OK"
+        c["classe"] = c["classe"] or (dados["capa"].get("classe_judicial") or "").upper()
+        c["oabs"] |= {a["oab_numero"] + a["oab_uf"] for a in dados["advogados"]
+                      if a["polo"] == "ATIVO" and a["oab_numero"]}
+        credor, ente_ok, como = confirmar(dados["partes"], alvo, lead, iniciais_credor, unico)
+        if credor and ente_ok:
+            doc = so_digitos(credor["documento"])
+            c.update(confirmado=True, capa="PJE", dados=dados, partes=dados["partes"], como=como,
+                     credor={"nome": credor["nome"], "documento": doc if documento_valido(doc) else None})
+
+    def ordenados():
+        """Forte, ligado, credor como 1º autor, classe de execução e os mais novos primeiro."""
+        return sorted(cands, key=lambda n: (not cands[n]["forte"], "LIGADO" not in cands[n]["fontes"],
+                                            not cands[n]["primeiro"], not CLASSE_EXECUCAO.search(cands[n]["classe"]),
+                                            -int(n[9:13])))
+
+    # 2. originário conhecido: abre direto pelo número, sem pesquisar o nome
     for n in lead["ligados"]:
         somar(n, "LIGADO", forte=True)
     for n, tipo in pistas_do_rpa(cur, lead["motivos"]).items():
@@ -835,68 +995,54 @@ def processar(cur, lead, djen, pje, inicio):
     for n in info["citados"]:
         if int(n[9:13]) <= int(prec20[9:13]):
             somar(n, "DJEN_CITA", forte=True)
+    conhecidos = ordenados()
+    for n in conhecidos:
+        abrir(n)
+    r["caminho"] = "ORIGINARIO_CONHECIDO" if conhecidos else ""
 
-    saturou_tudo = False
-    for nome in nomes:
-        tempo()
-        linhas, saturou = pje.por_nome(nome)
-        if saturou and lead["autuado_ate"]:
-            linhas, saturou = pje.por_nome(nome, lead["autuado_ate"])
-        saturou_tudo |= saturou
-        for x in linhas:
-            if x["numero"] and cnj_1g_tjma(x["numero"]) and int(x["numero"][9:13]) <= int(prec20[9:13]) \
-                    and not RE_CLASSE_FORA.search(normal(x["classe"])) \
-                    and (ente_no_nome(RE_E_OUTROS.sub("", x["passivo"]), lead["chaves"], lead["estadual"])
-                         or RE_E_OUTROS.search(x["passivo"])):
-                somar(x["numero"], "PJE_NOME", linha=x)
-    if saturou_tudo or not cands:
-        tempo()
-        for n, classe in candidatos_djen_nome(djen, prec20, nomes, alvo, lead["chaves"], lead["estadual"]).items():
-            somar(n, "DJEN_NOME", classe=classe)
-    if not cands:
-        r["motivo"] = f"PROCESSO_NAO_ENCONTRADO: nenhum candidato no PJe nem no DJEN para {nomes[0]}"
-        return r
-
-    # 3. confirma: forte, ligado, credor como 1º autor, classe de execução e os mais novos primeiro
-    ordem = sorted(cands, key=lambda n: (not cands[n]["forte"], "LIGADO" not in cands[n]["fontes"],
-                                         not cands[n]["primeiro"], not CLASSE_EXECUCAO.search(cands[n]["classe"]),
-                                         -int(n[9:13])))
+    # 3. nenhum originário conhecido confirmou: método pelo nome do credor
+    if not any(cands[n].get("confirmado") for n in conhecidos):
+        if not info["publicacoes"]:
+            r.update(status="ADIAR", motivo="AINDA_SEM_PUBLICACAO: precatório sem publicação no DJEN"
+                     + (f" (originário conhecido não confirmou: {len(conhecidos)})" if conhecidos else ""))
+            return r
+        if not nomes:
+            r["motivo"] = (f"SEM_BENEFICIARIO: credor não identificado nas {info['publicacoes']} publicações do DJEN "
+                           f"(rótulos: {', '.join(info['rotulos'])[:200] or 'nenhum'})"
+                           + (f"; {len(conhecidos)} originário(s) conhecido(s) sem o credor" if conhecidos else ""))
+            return r
+        r["caminho"] = "ORIGINARIO_CONHECIDO+NOME" if conhecidos else "NOME"
+        saturou_tudo = False
+        for nome in nomes:
+            tempo()
+            linhas, saturou = pje.por_nome(nome)
+            if saturou and lead["autuado_ate"]:
+                linhas, saturou = pje.por_nome(nome, lead["autuado_ate"])
+            saturou_tudo |= saturou
+            for x in linhas:
+                if x["numero"] and cnj_1g_tjma(x["numero"]) and int(x["numero"][9:13]) <= int(prec20[9:13]) \
+                        and not RE_CLASSE_FORA.search(normal(x["classe"])) \
+                        and (ente_no_nome(RE_E_OUTROS.sub("", x["passivo"]), lead["chaves"], lead["estadual"])
+                             or RE_E_OUTROS.search(x["passivo"])):
+                    somar(x["numero"], "PJE_NOME", linha=x)
+        if saturou_tudo or not cands:
+            tempo()
+            for n, classe in candidatos_djen_nome(djen, prec20, nomes, alvo, lead["chaves"], lead["estadual"]).items():
+                somar(n, "DJEN_NOME", classe=classe)
+        if not cands:
+            r["motivo"] = f"PROCESSO_NAO_ENCONTRADO: nenhum candidato no PJe nem no DJEN para {nomes[0]}"
+            return r
+        ordem = ordenados()
+        com_forte = [n for n in ordem if cands[n]["forte"]]
+        decisivo = ordem[0] if len(cands) == 1 else com_forte[0] if len(com_forte) == 1 else None
+        for n in ordem:
+            if not cands[n].get("aberto"):
+                abrir(n)
+            if cands[n].get("confirmado") and n == decisivo:   # o desempate já aponta este: não abre os outros
+                break
+    ordem = ordenados()
     com_forte = [n for n in ordem if cands[n]["forte"]]
     decisivo = ordem[0] if len(cands) == 1 else com_forte[0] if len(com_forte) == 1 else None
-    abertos = 0
-    for n in ordem:
-        tempo()
-        c = cands[n]
-        existentes = partes_do_banco(cur, formatar_cnj(n))
-        partes_bd = [{"nome": e["nome"], "documento": e["documento"] or "", "polo": e["polo"]}
-                     for e in existentes if e["papel"] != "ADVOGADO"]
-        credor, ente_ok = confirmar(partes_bd, alvo, lead)
-        if credor and ente_ok and documento_valido(credor["documento"]):
-            c.update(confirmado=True, capa="BANCO", partes=partes_bd,
-                     credor={"nome": credor["nome"], "documento": so_digitos(credor["documento"])})
-            c["oabs"] |= {f"{e['oab_numero']}{e['oab_uf']}" for e in existentes
-                          if e["papel"] == "ADVOGADO" and e["polo"] == "ATIVO" and e["oab_numero"]}
-        elif abertos < MAX_ABERTOS_PJE:
-            abertos += 1
-            linha = c["linha"] or pje.por_numero(n)
-            if not linha:
-                c["pje"] = "NAO_ENCONTRADO"
-            else:
-                dados = pje.detalhe(linha["link"], n, alvo, prazo=inicio + TETO_CREDITO - 15)
-                time.sleep(PAUSA_PJE)
-                c["pje"] = "OK"
-                c["classe"] = c["classe"] or (dados["capa"].get("classe_judicial") or "").upper()
-                c["oabs"] |= {a["oab_numero"] + a["oab_uf"] for a in dados["advogados"]
-                              if a["polo"] == "ATIVO" and a["oab_numero"]}
-                credor, ente_ok = confirmar(dados["partes"], alvo, lead)
-                if credor and ente_ok:
-                    doc = so_digitos(credor["documento"])
-                    c.update(confirmado=True, capa="PJE", dados=dados, partes=dados["partes"],
-                             credor={"nome": credor["nome"], "documento": doc if documento_valido(doc) else None})
-        else:
-            c["pje"] = "NAO_ABERTO"
-        if c.get("confirmado") and n == decisivo:       # o desempate já aponta este: não precisa abrir os outros
-            break
 
     # 4. decide
     conf = [n for n in ordem if cands[n].get("confirmado")]
@@ -926,6 +1072,7 @@ def processar(cur, lead, djen, pje, inicio):
     r["candidatos"] = [{"cnj": formatar_cnj(n), "fontes": cands[n]["fontes"], "valor": cands[n]["valor"],
                         "forte": cands[n]["forte"], "confirmado": bool(cands[n].get("confirmado")),
                         "capa": cands[n].get("capa"), "pje": cands[n].get("pje"), "classe": cands[n]["classe"],
+                        "credor_por": cands[n].get("como"),
                         "credor_doc": (cands[n].get("credor") or {}).get("documento")}
                        for n in ordem[:20]]
 
@@ -942,7 +1089,7 @@ def processar(cur, lead, djen, pje, inicio):
         if c["credor"]["documento"]:
             r.update(credor=c["credor"],
                      status="SUCESSO_PROCESSO_ORIGINARIO" if c["forte"] else "SUCESSO_PARTES_SEM_VALOR",
-                     motivo=f"cnj={formatar_cnj(escolhido)} regra={regra} fontes={r['fontes']} "
+                     motivo=f"cnj={formatar_cnj(escolhido)} regra={regra} fontes={r['fontes']} credor_por={c['como']} "
                             f"partes={len(c['partes'])} capa={c['capa']}")
         else:
             r["motivo"] = f"SEM_CPF_CREDOR: cnj={formatar_cnj(escolhido)} regra={regra} (credor sem CPF no PJe)"
@@ -966,7 +1113,8 @@ def processar(cur, lead, djen, pje, inicio):
                  motivo=f"PROC_SEM_CAPA: cnj={formatar_cnj(decisivo)} regra={regra_forte(decisivo)} "
                         f"(não abre no PJe público)")
     else:
-        r["motivo"] = f"PROCESSO_NAO_ENCONTRADO: {len(cands)} candidato(s), nenhum confirmado para {nomes[0]}"
+        r["motivo"] = f"PROCESSO_NAO_ENCONTRADO: {len(cands)} candidato(s), nenhum confirmado para " \
+                      f"{nomes[0] if nomes else 'o credor'}"
     return r
 
 # =============================================================================== banco: gravação de um crédito
@@ -1241,6 +1389,8 @@ def registrar_metadata(cur, lead, r):
                               "oabs": r["oabs_precatorio"], "cessao": r["cessao"]}}
     if r["capa_escolhida"]:
         meta["capa_originario"] = r["capa_escolhida"]
+    if lead.get("pagamento"):
+        meta["pagamento"] = lead["pagamento"]           # situação no hotsite do TJMA quando o robô passou
     cur.execute("""SELECT 1 FROM creditos.credito WHERE id = %s
                       AND numero_norm = COALESCE(creditos.cnj_normalizar(%s), creditos.so_digitos(%s))""",
                 (lead["credito_id"], lead["numero_norm"], lead["numero_norm"]))
@@ -1255,12 +1405,69 @@ def registrar_metadata(cur, lead, r):
         raise RuntimeError("registrar_credito devolveu outro crédito")
 
 
+def mesma_pessoa(a, b):
+    """Mesmo nome, ou grafia próxima o bastante (SOUSA x SOUZA, acento, 'FILHO' faltando não conta)."""
+    a, b = chave_nome(a), chave_nome(b)
+    return a == b or SequenceMatcher(None, a, b).ratio() >= SEMELHANCA_MESMA_PESSOA
+
+
+def corrigir_credor(cur, lead, credor, bk):
+    """A fonte vence o banco: com o CPF do credor confirmado na fonte, apaga os vínculos de CREDOR do crédito que são
+    a mesma pessoa (mesmo nome ou grafia próxima) com outro documento, e troca o CPF na capa antiga do precatório
+    (senão o espelho do legado recriaria o vínculo errado). Herdeiro, cessionário, sucessor e advogado não são tocados;
+    credor com outro nome (outra pessoa) fica. O banco audita cada DELETE em creditos.auditoria_alteracao e o
+    desfazer_legado_*.sql guarda o INSERT que o recria. Devolve o que foi corrigido (para o CSV)."""
+    cur.execute("""SELECT cc.*, p.nome AS _nome, p.documento::text AS _documento
+                     FROM creditos.credito_credor cc JOIN creditos.pessoa p ON p.id = cc.pessoa_id
+                    WHERE cc.credito_id = %s AND cc.papel_id = 1
+                      AND p.documento IS DISTINCT FROM creditos.documento_normalizar(%s)
+                      FOR UPDATE OF cc""", (lead["credito_id"], credor["documento"]))
+    corrigidos = []
+    for linha in como_dicts(cur):
+        nome, doc = linha.pop("_nome"), linha.pop("_documento")
+        if not mesma_pessoa(nome, credor["nome"]):
+            continue
+        bk.delete(cur, "creditos.credito_credor", linha)
+        cur.execute("DELETE FROM creditos.credito_credor WHERE id = %s", (linha["id"],))
+        corrigidos.append(f"{nome} ({doc or 'sem doc'}, {linha['origem']}) -> {credor['documento']}")
+    cur.execute("""SELECT x.id, x.nome, x.cpf_cnpj
+                     FROM precatorios.partes_processuais x
+                     JOIN precatorios.processos_precatorios pp ON pp.id = x.processo_id
+                    WHERE regexp_replace(pp.numero_cnj::text, '\\D', '', 'g') = %s AND x.polo = 'ATIVO'
+                      AND x.cpf_cnpj IS DISTINCT FROM %s
+                      FOR UPDATE OF x""", (lead["precatorio20"], credor["documento"]))
+    for pid, nome, doc in cur.fetchall():
+        if mesma_pessoa(nome, credor["nome"]) and so_digitos(doc) != credor["documento"]:
+            bk.update(cur, "precatorios.partes_processuais", {"id": pid}, {"cpf_cnpj": doc})
+            cur.execute("UPDATE precatorios.partes_processuais SET cpf_cnpj = %s WHERE id = %s",
+                        (credor["documento"], pid))
+            corrigidos.append(f"capa antiga do precatório: {nome} ({doc or 'sem doc'}) -> {credor['documento']}")
+    return corrigidos
+
+
+def autores(dados, lead):
+    """Pessoas distintas do polo ativo que não são o ente (mais de 1 = ação coletiva)."""
+    return {chave_nome(p["nome"]) for p in dados["partes"]
+            if p["polo"] == "ATIVO" and not ente_no_nome(p["nome"], lead["chaves"], lead["estadual"])}
+
+
+def recorte_do_credor(dados, credor, oabs_precatorio):
+    """Ação coletiva: só o credor confirmado, o polo passivo e os advogados do precatório (OAB no DJEN), com
+    completa=False (só acrescenta). Gravar todos os autores faria o recálculo do banco ligar cada um deles ao precatório
+    como credor, e mexer nos credores dos outros precatórios do mesmo processo."""
+    return {**dados, "completa": False,
+            "partes": [p for p in dados["partes"]
+                       if p["polo"] == "PASSIVO" or mesma_pessoa(p["nome"], credor["nome"])],
+            "advogados": [a for a in dados["advogados"]
+                          if a["polo"] == "ATIVO" and a["oab_numero"] + a["oab_uf"] in oabs_precatorio]}
+
+
 def gravar(cur, lead, r, filas, status_legado, bk):
     """Grava o resultado de um crédito (quem chama cuida do SAVEPOINT e do COMMIT). Devolve o resumo para o CSV."""
     cid = lead["credito_id"]
     id_do_software(cur, criar=True)                     # na simulação ele nasce e morre nesta transação
     antes = credores_do_credito(cur, cid)
-    resumo, legado, proc_escolhido = [], Counter(), None
+    resumo, legado, proc_escolhido, corrigidos = [], Counter(), None, []
     if r["originario"]:
         cur.execute("SELECT creditos.fila_credor_registrar_originario(%s, %s, %s)",
                     (cid, WORKER, [formatar_cnj(r["originario"])]))
@@ -1274,10 +1481,21 @@ def gravar(cur, lead, r, filas, status_legado, bk):
             cur.execute("""SELECT creditos.registrar_credor(p_credito_id => %s, p_papel => 'CREDOR', p_nome => %s,
                                                             p_documento => %s, p_processo_id => %s, p_fonte => %s)""",
                         (cid, r["credor"]["nome"], r["credor"]["documento"], proc_escolhido, SOFTWARE))
+            corrigidos = corrigir_credor(cur, lead, r["credor"], bk)
+    # capa só do originário escolhido e só quando veio do PJe (a do banco não traz nada novo e o registrar_capa
+    # recalcularia os credores do processo inteiro); na ação coletiva, só o credor
+    coletiva = 0
     for cnj, fonte, dados in r["capas"]:
+        if cnj != r["originario"] or fonte != "PJE":
+            continue
+        coletiva = len(autores(dados, lead))
+        if coletiva > 1:
+            if not (r["credor"] and r["credor"]["documento"]):
+                continue                                # coletiva sem o CPF do credor: não há o que recortar
+            dados = recorte_do_credor(dados, r["credor"], set(r["oabs_precatorio"].split(",")) - {""})
         travar_processo(cur, cnj)
         partes, advogados = partes_para_banco(cur, dados, partes_do_banco(cur, formatar_cnj(cnj)), fonte)
-        capa = capa_para_banco(dados["capa"]) if fonte == "PJE" else None
+        capa = capa_para_banco(dados["capa"])
         cur.execute("SELECT creditos.registrar_capa(%s, %s::jsonb, %s::jsonb, %s::jsonb)",
                     (formatar_cnj(cnj), json.dumps(partes, ensure_ascii=False),
                      json.dumps(advogados, ensure_ascii=False),
@@ -1285,9 +1503,8 @@ def gravar(cur, lead, r, filas, status_legado, bk):
         res = cur.fetchone()[0]
         resumo.append(f"{formatar_cnj(cnj)} ({fonte}): partes +{res['partes_inseridas']}/-{res['partes_removidas']} "
                       f"credores +{res['credores_inseridos']}/-{res['credores_removidos']}")
-        if fonte == "PJE":
-            legado += gravar_capa_legado(cur, cnj, dados, r["status"] == "SUCESSO_PROCESSO_ORIGINARIO"
-                                         and cnj == r["originario"], lead["precatorio"], bk)
+        legado += gravar_capa_legado(cur, cnj, dados, r["status"] == "SUCESSO_PROCESSO_ORIGINARIO",
+                                     lead["precatorio"], bk)
     registrar_metadata(cur, lead, r)
     legado += atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk)
     depois = credores_do_credito(cur, cid)
@@ -1303,7 +1520,7 @@ def gravar(cur, lead, r, filas, status_legado, bk):
                  formatar_cnj(r["originario"]) if r["originario"] else None,
                  json.dumps(detalhe, ensure_ascii=False, default=str), socket.gethostname()))
     return {"banco": " | ".join(resumo), "legado": ", ".join(f"{k}={v}" for k, v in sorted(legado.items())),
-            "antes": antes, "depois": depois}
+            "antes": antes, "depois": depois, "corrigidos": corrigidos, "coletiva": coletiva}
 
 # =============================================================================== banco: gravação em lote
 
@@ -1389,6 +1606,7 @@ def registrar_lote(rod, lote, gravados):
                                            f"{' ok' if c['confirmado'] else ''}{' ' + c['capa'] if c['capa'] else ''}]"
                                            for c in r["candidatos"]),
                      capa_fonte=";".join(f for _, f, _ in r["capas"]), banco=g["banco"], legado=g["legado"],
+                     credor_corrigido=" | ".join(g["corrigidos"]), coletiva=g["coletiva"] or "",
                      credores_antes=fmt_credores(g["antes"]), credores_depois=fmt_credores(g["depois"]),
                      lote=rod.n_lote)
         rod.resultados[r["status"]] += 1
@@ -1413,55 +1631,69 @@ def descarregar(rod, pendentes):
 # =============================================================================== fila
 
 
-def assumir_fila(con, id_software, rodada):
-    """Passa para o robô as linhas do TJMA do RPA fora de lease; PENDENTE para quem não tem credor.
-    Guarda backup e o SQL que devolve tudo ao RPA."""
-    with con.cursor() as cur:
-        cur.execute("""SELECT cc.credito_id, cc.status_id, cc.disponivel_em,
-                              (c.saiu_da_lista_em IS NULL AND NOT EXISTS (
-                                 SELECT 1 FROM creditos.credito_credor k
-                                  WHERE k.credito_id = cc.credito_id AND k.papel_id <> 2)) AS sem_credor
-                         FROM creditos.coleta_credor cc
-                         JOIN creditos.credito c ON c.id = cc.credito_id
-                        WHERE cc.tribunal_id = %s AND cc.software_id = %s AND cc.status_id <> 2
-                          FOR UPDATE OF cc SKIP LOCKED""", (TRIBUNAL_TJMA, SOFTWARE_RPA))
-        linhas = cur.fetchall()
-        if not linhas:
-            con.commit()
-            return 0, 0
-        ids = [linha[0] for linha in linhas]
-        pendentes = [linha[0] for linha in linhas if linha[3]]
-        cur.execute("UPDATE creditos.coleta_credor SET software_id = %s, updated_at = now() WHERE credito_id = ANY(%s)",
-                    (id_software, ids))
-        cur.execute("UPDATE creditos.coleta_credor SET status_id = 1, disponivel_em = now() WHERE credito_id = ANY(%s)",
-                    (pendentes,))
-        colunas = ["credito_id", "status_id", "disponivel_em", "sem_credor"]
-        anexar_csv(SAIDA / f"fetch_fila_backup_{rodada}.csv", colunas,
-                   [dict(zip(colunas, linha)) for linha in linhas])
-        with open(SAIDA / f"desfazer_fila_{rodada}.sql", "a", encoding="utf-8") as f:
-            f.write("-- Devolve ao RPA (software 2), com o status de antes, as linhas que o robô assumiu.\nBEGIN;\n")
-            for i in range(0, len(linhas), 1000):
-                valores = ",\n".join(cur.mogrify("(%s, %s, %s::timestamptz)", linha[:3]).decode()
-                                     for linha in linhas[i:i + 1000])
-                f.write(f"UPDATE creditos.coleta_credor cc SET software_id = {SOFTWARE_RPA}, status_id = v.status_id, "
-                        f"disponivel_em = v.disponivel_em, updated_at = now()\n  FROM (VALUES\n{valores}\n) "
-                        f"v(credito_id, status_id, disponivel_em)\n WHERE cc.credito_id = v.credito_id "
-                        f"AND cc.software_id = {id_software} AND cc.status_id <> 2;\n")
-            f.write("COMMIT;\n")
-    con.commit()
-    return len(ids), len(pendentes)
+# o que o robô pode pegar: do RPA em PENDENTE, do RPA sem credor em qualquer status (menos EM_ANDAMENTO) e o que já é
+# do robô em PENDENTE; sempre vencido o disponivel_em. O que já é do robô com status final (SUCESSO/FALHA) não volta.
+FILTRO_PEGAVEL = f"""cc.disponivel_em <= now() AND (
+       (cc.software_id = {SOFTWARE_RPA}
+        AND (cc.status_id = 1 OR NOT EXISTS (SELECT 1 FROM creditos.credito_credor k
+                                              WHERE k.credito_id = cc.credito_id AND k.papel_id <> 2)))
+    OR (cc.software_id = (SELECT id FROM creditos.software WHERE codigo = '{SOFTWARE}') AND cc.status_id = 1))"""
 
 
-def pegar(con, lease):
-    """Reserva o próximo crédito do TJMA na fila (lease para este worker); None se a fila está vazia."""
+def reservar(con, credito_id, lease, id_software):
+    """Reserva UM crédito (lease para este worker) se ele ainda é pegável, passando-o para o software do robô nesse
+    momento (a fila do RPA só muda lead a lead, no que o robô de fato pega). UPDATE atômico: se outra instância já o
+    pegou, não afeta nenhuma linha. Devolve (software, status, disponivel_em) de antes, ou None."""
     with con.cursor() as cur:
-        cur.execute("""SELECT credito_id
-                         FROM creditos.fila_credor_pegar(p_tribunal => 'TJMA', p_worker => %s, p_quantidade => 1,
-                                                         p_lease => %s::interval, p_software => %s)""",
-                    (WORKER, lease, SOFTWARE))
-        linha = cur.fetchone()
+        cur.execute(f"""WITH alvo AS (
+                          SELECT cc.credito_id, cc.software_id, cc.status_id, cc.disponivel_em
+                            FROM creditos.coleta_credor cc
+                            JOIN creditos.credito c ON c.id = cc.credito_id
+                           WHERE cc.credito_id = %s AND cc.tribunal_id = %s AND c.saiu_da_lista_em IS NULL
+                             AND cc.status_id <> 2 AND {FILTRO_PEGAVEL}
+                             FOR UPDATE OF cc SKIP LOCKED)
+                        UPDATE creditos.coleta_credor cc
+                           SET status_id = 2, software_id = %s, lease_worker = %s,
+                               lease_ate = now() + %s::interval, reservado_em = now(), updated_at = now()
+                          FROM alvo
+                         WHERE cc.credito_id = alvo.credito_id
+                        RETURNING alvo.software_id, alvo.status_id, alvo.disponivel_em""",
+                    (credito_id, TRIBUNAL_TJMA, id_software, WORKER, lease))
+        antes = cur.fetchone()
     con.commit()
-    return linha[0] if linha else None
+    return antes
+
+
+def anotar_desfazer_fila(rod, credito_id, antes):
+    """Lead que era do RPA: guarda o UPDATE que o devolve ao RPA com o status de antes (desfazer_fila_<rodada>.sql)."""
+    software, status, disponivel = antes
+    if software != SOFTWARE_RPA:
+        return
+    arquivo = SAIDA / f"desfazer_fila_{rod.rodada}.sql"
+    novo = not arquivo.exists()
+    with rod.con.cursor() as cur, open(arquivo, "a", encoding="utf-8") as f:
+        if novo:
+            f.write("-- Devolve ao RPA (software 2), com o status de antes, os leads que o robô pegou.\n")
+        f.write(cur.mogrify(f"UPDATE creditos.coleta_credor SET software_id = {SOFTWARE_RPA}, status_id = %s, "
+                            f"disponivel_em = %s::timestamptz, updated_at = now() WHERE credito_id = %s "
+                            f"AND software_id = {rod.id_software} AND status_id <> 2;\n",
+                            (status, disponivel, credito_id)).decode())
+
+
+def pegar(rod):
+    """Próximo crédito na ordem do robô (não pagos primeiro) que consegue reservar. Acabou a lista: refaz a ordem uma
+    vez (entram os adiados que venceram); vazia de novo, a fila acabou (None)."""
+    for tentativa in (1, 2):
+        while rod.posicao < len(rod.ordem):
+            credito_id = rod.ordem[rod.posicao]
+            rod.posicao += 1
+            antes = reservar(rod.con, credito_id, rod.lease, rod.id_software)
+            if antes:
+                anotar_desfazer_fila(rod, credito_id, antes)
+                return credito_id
+        if tentativa == 1:
+            rod.reordenar()
+    return None
 
 
 def devolver(con, credito_id, motivo=None, intervalo=ADIAMENTO):
@@ -1475,30 +1707,17 @@ def devolver(con, credito_id, motivo=None, intervalo=ADIAMENTO):
     con.commit()
 
 
-def amostra_simulacao(con, quantidade):
-    """Créditos do escopo (ativos, sem credor), alternando status e motivo, fora de lease. Só leitura."""
-    with con.cursor() as cur:
-        cur.execute("""SELECT credito_id FROM (
-                         SELECT cc.credito_id, row_number() OVER (PARTITION BY cc.status_id, cc.motivo_id
-                                                                  ORDER BY md5(cc.credito_id::text)) AS vez
-                           FROM creditos.coleta_credor cc JOIN creditos.credito c ON c.id = cc.credito_id
-                          WHERE cc.tribunal_id = %s AND c.saiu_da_lista_em IS NULL AND cc.status_id <> 2
-                            AND NOT EXISTS (SELECT 1 FROM creditos.credito_credor k
-                                             WHERE k.credito_id = cc.credito_id AND k.papel_id <> 2)) x
-                        ORDER BY vez, credito_id LIMIT %s""", (TRIBUNAL_TJMA, quantidade))
-        return [i for (i,) in cur.fetchall()]
-
 # =============================================================================== execução
 
 
 class Rodada:
     """Estado de uma execução: modo, conexões, arquivos de saída, backup, DJEN, PJe por thread e contadores.
-    Ao nascer prepara o banco (software, filas antigas, status do legado) e a fila (amostra na simulação,
-    assumir_fila no modo real)."""
+    Ao nascer prepara o banco (software, filas antigas, status do legado) e a ordem da fila (na simulação, a amostra
+    sai dela e nada é reservado)."""
 
-    def __init__(self, simulacao, limite, trabalhadores, usar_proxies):
+    def __init__(self, simulacao, limite, workers, usar_proxies, creditos=()):
         SAIDA.mkdir(exist_ok=True)
-        self.simulacao, self.limite, self.trabalhadores = simulacao, limite, trabalhadores
+        self.simulacao, self.limite, self.workers = simulacao, limite, workers
         self.modo, sufixo = ("SIMULACAO", "_simulacao") if simulacao else ("REAL", "")
         self.rodada = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.arq_credito = SAIDA / f"fetch_TJMA{sufixo}.csv"
@@ -1507,8 +1726,8 @@ class Rodada:
                          SAIDA / f"fetch_legado_backup{sufixo}.csv", self.rodada, self.modo)
         self.resultados, self.falhas_seguidas, self.n, self.n_lote = Counter(), 0, 0, 0
         self.parar, self.fila_vazia = threading.Event(), False
-        # o 1º crédito do lote espera os outros LOTE-1, que andam `trabalhadores` por vez
-        self.lease = f"{(LOTE // trabalhadores + 2) * TETO_CREDITO // 60 + 30} minutes"
+        # o 1º crédito do lote espera os outros LOTE-1, que andam `workers` por vez
+        self.lease = f"{(LOTE // workers + 2) * TETO_CREDITO // 60 + 30} minutes"
         self.local, self.conexoes, self.trava = threading.local(), [], threading.Lock()
 
         self.con = conectar(escrita=True)
@@ -1520,26 +1739,36 @@ class Rodada:
         self.con.commit()
         self.djen = Djen(self.parar, usar_proxies)
         log.info(f"{self.modo} | worker {WORKER} | software {SOFTWARE} (id {self.id_software}) | lote de {LOTE} | "
-                 f"{trabalhadores} trabalhadores | lease {self.lease} | DJEN: "
+                 f"{workers} workers | lease {self.lease} | DJEN: "
                  f"{', '.join(s.nome for s in self.djen.saidas)} | filas antigas: {', '.join(self.filas)}")
+        self.pagamentos, self.info = pagamentos_tjma(), {}
         if simulacao:
-            con_l = conectar()
-            try:
-                self.fila_simulada = amostra_simulacao(con_l, limite or AMOSTRA_SIMULACAO)
-            finally:
-                con_l.close()
-            log.info(f"amostra: {len(self.fila_simulada)} créditos (nada é reservado; cada lote é desfeito no fim)")
+            ordem = self.ordenar()
+            self.fila_simulada = list(creditos) or ordem[:limite or AMOSTRA_SIMULACAO]
+            log.info(f"amostra: {len(self.fila_simulada)} créditos "
+                     f"({'os informados em --creditos' if creditos else 'os primeiros da ordem do robô'}; "
+                     f"nada é reservado; cada lote é desfeito no fim)")
         else:
             with self.con.cursor() as cur:
                 cur.execute("SELECT creditos.fila_credor_expirar_leases()")
             self.con.commit()
-            self.assumir()
+            self.reordenar()
 
-    def assumir(self):
-        """Roda assumir_fila e anota a hora (para repetir a cada ASSUMIR_A_CADA)."""
-        movidas, pendentes = assumir_fila(self.con, self.id_software, self.rodada)
-        self.ultima_assumida = time.time()
-        log.info(f"fila assumida: {movidas} linhas do RPA passaram para o robô ({pendentes} sem credor, em PENDENTE)")
+    def ordenar(self):
+        """Ordem do robô (não pagos primeiro) e a situação de pagamento de cada crédito pegável."""
+        con_l = conectar()
+        try:
+            ordem, info, contagem = ordenar_escopo(con_l, self.pagamentos, FILTRO_PEGAVEL)
+        finally:
+            con_l.close()
+        self.info = info
+        log.info(f"ordem da fila: {len(ordem)} créditos | " + ", ".join(
+            f"{s}: {contagem[s]}" for s in [*FAIXAS.values(), FORA_DA_LISTA]) + " (fora da lista não é pego)")
+        return ordem
+
+    def reordenar(self):
+        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA)."""
+        self.ordem, self.posicao, self.ultima_ordem = self.ordenar(), 0, time.time()
 
     def da_thread(self):
         """(conexão de leitura, PJe) da thread que chama; criados na 1ª vez."""
@@ -1560,15 +1789,15 @@ class Rodada:
 
 def proximo_credito(rod):
     """Id do próximo crédito, ou None (amostra acabou, fila vazia, --limite, parada por falhas).
-    Fora da simulação reserva o crédito com lease e, a cada ASSUMIR_A_CADA, assume de novo a fila do RPA."""
+    Fora da simulação reserva o crédito com lease e, a cada REORDENAR_A_CADA, remonta a ordem da fila."""
     if rod.parar.is_set() or rod.fila_vazia or (rod.limite and rod.n >= rod.limite):
         return None
     if rod.simulacao:
         credito_id = rod.fila_simulada.pop(0) if rod.fila_simulada else None
     else:
-        if time.time() - rod.ultima_assumida > ASSUMIR_A_CADA:
-            rod.assumir()
-        credito_id = pegar(rod.con, rod.lease)
+        if time.time() - rod.ultima_ordem > REORDENAR_A_CADA:
+            rod.reordenar()
+        credito_id = pegar(rod)
     if credito_id:
         rod.n += 1
     else:
@@ -1586,8 +1815,11 @@ def processar_credito(rod, credito_id, n):
         con, pje = rod.da_thread()
         with con.cursor() as cur:
             lead = ler_credito(cur, credito_id)
+            pag = rod.info.get(credito_id) or {}
+            lead["pagamento"] = {"situacao": pag.get("situacao"), "pdfs_pagos": pag.get("arquivos") or [],
+                                 "lista_vigente": rod.pagamentos and f"{rod.pagamentos['data_lista']:%d/%m/%Y}"}
             linha.update(precatorio=lead["precatorio"], ente=lead["ente_nome"] or lead["ente_lista"],
-                         ultimo_status=lead["ultimo_status"])
+                         ultimo_status=lead["ultimo_status"], pagamento=pag.get("situacao") or "")
             r = processar(cur, lead, rod.djen, pje, inicio)
     except Exception as e:                              # erro passageiro (ou inesperado): volta para a fila
         tecnico = isinstance(e, ErroTecnico)
@@ -1603,7 +1835,7 @@ def processar_credito(rod, credito_id, n):
         return {"tipo": "ADIAR", "credito_id": credito_id, "motivo": motivo, "intervalo": ADIAMENTO, "linha": linha,
                 "tecnico": True}
     linha["segundos"] = round(time.time() - inicio)
-    linha.update(credor_djen=r["credor_djen"], publicacoes_djen=r["publicacoes"], oabs_precatorio=r["oabs_precatorio"],
+    linha.update(caminho=r["caminho"], credor_djen=r["credor_djen"], publicacoes_djen=r["publicacoes"], oabs_precatorio=r["oabs_precatorio"],
                  cessao="sim" if r["cessao"] else "")
     log.info(f"[{n}] {credito_id} {lead['precatorio']} -> {r['status']} "
              f"{formatar_cnj(r['originario']) if r['originario'] else ''} "
@@ -1654,37 +1886,44 @@ def encerrar(rod, pendentes, inicio):
     finally:
         rod.fechar()
     minutos = max((time.time() - inicio) / 60, 1 / 60)
+    log.info(f"DJEN: {rod.djen.n_429} resposta(s) 429 (limite de ritmo)")
     log.info(f"{rod.modo}: {rod.n} crédito(s) em {rod.n_lote} lote(s), {minutos:.1f} min "
              f"({rod.n / minutos:.1f}/min) | " + ", ".join(f"{k}: {v}" for k, v in rod.resultados.most_common()))
     log.info(f"CSV: {rod.arq_credito}")
 
 
 def ler_argumentos():
-    """--simulacao, --limite N, --trabalhadores N e --proxies."""
+    """--simulacao, --limite N, --workers N, --creditos e --proxies."""
     ap = argparse.ArgumentParser(description="Credor do TJMA pela consulta pública (DJEN + PJe 1º grau), "
                                              f"gravado no banco em lotes de {LOTE}.")
     ap.add_argument("--simulacao", action="store_true",
                     help=f"{AMOSTRA_SIMULACAO} créditos (ou --limite), faz tudo e desfaz no banco (ROLLBACK)")
     ap.add_argument("--limite", type=int, default=None, help="para depois de N créditos (padrão: até a fila acabar)")
-    ap.add_argument("--trabalhadores", type=int, default=TRABALHADORES,
-                    help=f"threads raspando ao mesmo tempo (padrão {TRABALHADORES})")
+    ap.add_argument("--workers", type=int, default=WORKERS,
+                    help=f"workers raspando ao mesmo tempo, como threads deste processo (padrão {WORKERS}); "
+                         "diferente do TJBA, não sobe um processo por worker")
+    ap.add_argument("--creditos", default="",
+                    help="só na simulação: ids de crédito separados por vírgula (no lugar dos primeiros da fila)")
     ap.add_argument("--proxies", action="store_true",
                     help="soma PROXY_01..05 do .env como saídas do DJEN (precisam sair pelo Brasil)")
     return ap.parse_args()
 
 
 def main():
-    """Laço principal: mantém `trabalhadores` créditos raspando, junta os prontos no lote e grava a cada LOTE.
+    """Laço principal: mantém `workers` créditos raspando, junta os prontos no lote e grava a cada LOTE.
     Ctrl+C devolve os créditos em andamento para a fila; o lote já processado é gravado ao encerrar."""
     args = ler_argumentos()
     configurar_log(__file__, SAIDA / "logs")
     inicio = time.time()
-    rod = Rodada(args.simulacao, args.limite, max(1, args.trabalhadores), args.proxies)
+    creditos = [int(x) for x in re.findall(r"\d+", args.creditos)]
+    if creditos and not args.simulacao:
+        raise SystemExit("--creditos só vale com --simulacao")
+    rod = Rodada(args.simulacao, args.limite, max(1, args.workers), args.proxies, creditos)
     pendentes, em_voo = [], {}
-    executor = ThreadPoolExecutor(max_workers=rod.trabalhadores, thread_name_prefix="tjma")
+    executor = ThreadPoolExecutor(max_workers=rod.workers, thread_name_prefix="tjma")
     try:
         while True:
-            while len(em_voo) < rod.trabalhadores and (credito_id := proximo_credito(rod)):
+            while len(em_voo) < rod.workers and (credito_id := proximo_credito(rod)):
                 em_voo[executor.submit(processar_credito, rod, credito_id, rod.n)] = credito_id
             if not em_voo:
                 break

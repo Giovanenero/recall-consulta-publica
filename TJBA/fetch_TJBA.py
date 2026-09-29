@@ -17,7 +17,9 @@ acha e confirma o originário (DJEN + PJe 1º grau público) e grava o resultado
    e o status na fila (fila_credor_finalizar).
 
 Erro passageiro (captcha, portal fora, timeout) devolve o crédito para a fila (fila_credor_adiar) na hora e nunca
-vira FALHA. Ctrl+C desfaz o que estava em gravação e devolve o crédito em andamento para a fila.
+vira FALHA. PJe instável (pesquisa que não volta, tela de indisponível, 502): repete a pesquisa uma vez e, se
+seguir assim por 3 créditos, pausa todos os workers da máquina e testa o PJe a cada 10-30 min até ele voltar.
+Ctrl+C desfaz o que estava em gravação e devolve o crédito em andamento para a fila.
 
 Vários workers na mesma máquina: --workers N sobe os workers 1..N neste terminal (um processo filho por worker), ou
 --worker N roda só o worker N (um por terminal). A fila com lease garante que dois workers nunca pegam o mesmo
@@ -99,6 +101,11 @@ ADIAMENTO = "30 minutes"
 ADIAMENTO_CONFLITO = "5 minutes"       # deadlock com a gravação de outro worker: tenta de novo logo
 ASSUMIR_A_CADA = 30 * 60               # s entre rodadas de assumir_fila
 MAX_FALHAS_SEGUIDAS = 5                # falhas técnicas (ou de gravação) seguidas que param o robô
+PJE_INSTAVEL_PARA_PAUSAR = 3           # créditos seguidos com o PJe sem responder que pausam os workers da máquina
+PAUSAS_PJE = (10 * 60, 20 * 60, 30 * 60)   # s de cada pausa por instabilidade (a última se repete)
+PAUSA_PJE_MAXIMA = 6 * 60 * 60         # s somados de pausa sem o PJe voltar; passou disso, o worker para
+FOLGA_PAUSA = 10 * 60                  # s além do fim marcado que os outros workers ainda esperam (dá tempo da sonda)
+SONDA_PJE = "05104921520198050001"     # processo público que sempre abria: testa se o PJe voltou
 PAUSA_ENTRE_WORKERS = 10               # s entre subir um worker e o próximo (--workers): Chrome e captcha em escada
 AMOSTRA_SIMULACAO = 20
 FILA_ANTIGA_DESDE = "processos_unificados_2026_08"
@@ -133,6 +140,10 @@ RE_ORGAO_PUBLICO = re.compile(r"^(?:ESTADO D|MUNICIPIO D|UNIAO\b|DISTRITO FEDERA
 
 RE_LINK_DETALHE = re.compile(r"(/pje/ConsultaPublica/DetalheProcessoConsultaPublica/listView\.seam\?ca=[^'\"\s<>]+)")
 RE_NADA = re.compile(r"n[ãa]o\s+encontrou\s+nenhum\s+processo", re.I)
+RE_GRID_VAZIO = re.compile(r"'processosGridCount'\s*:\s*null")    # tabela de resultados vazia (resposta da pesquisa)
+# Páginas de erro do TJBA quando o PJe está fora: a tela "SISTEMA TEMPORARIAMENTE INDISPONÍVEL" e os 502/503/504.
+RE_PJE_FORA = re.compile(r"SISTEMA\s+TEMPORARIAMENTE\s+INDISPON|\b50[234]\s+(?:Bad\s+Gateway|Service\s+"
+                         r"(?:Temporarily\s+)?Unavailable|Gateway\s+Time-?out)", re.I)
 # Linha de parte como o PJe escreve: "FULANO - CPF: 000.000.000-00 (AUTOR)",
 # "BELTRANO - OAB BA12345 - CPF: ... (ADVOGADO)"
 RE_PARTE = re.compile(
@@ -178,6 +189,11 @@ SEM_GRAVACAO = {"banco": "", "legado": "", "antes": set(), "depois": set()}
 
 class ErroTecnico(Exception):
     """Falha passageira (captcha, PJe/DJEN fora do ar, timeout): o crédito volta para a fila, não vira FALHA."""
+
+
+class PjeInstavel(ErroTecnico):
+    """O PJe não respondeu à pesquisa, não carregou ou mostrou a tela de indisponível: problema do TJBA, não do
+    crédito. Não conta para MAX_FALHAS_SEGUIDAS; PJE_INSTAVEL_PARA_PAUSAR créditos seguidos pausam os workers."""
 
 # =============================================================================== utilidades
 
@@ -573,15 +589,26 @@ class Pje:
         self.fechar()
         self.abrir()
 
+    @staticmethod
+    def conferir_no_ar(resposta, html):
+        """PjeInstavel se a página carregada é um erro do TJBA (HTTP 5xx ou a tela de indisponível)."""
+        if resposta is not None and resposta.status >= 500:
+            raise PjeInstavel(f"PJE_INDISPONIVEL: HTTP {resposta.status}")
+        if RE_PJE_FORA.search(html):
+            raise PjeInstavel("PJE_INDISPONIVEL: tela de sistema indisponível")
+
     def esperar(self, pagina, condicao):
-        """Espera a condição no HTML resolvendo o captcha que abrir. ErroTecnico se não resolver ou não responder."""
+        """Espera a condição no HTML resolvendo o captcha que abrir. ErroTecnico se o captcha não sair; PjeInstavel
+        se o PJe mostrar a tela de indisponível ou não responder."""
         fim = time.time() + ESPERA_PJE
         tentadas, ultima = set(), 0.0
         while time.time() < fim:
             try:
-                achou = condicao(pagina.content())
+                html = pagina.content()
             except ErroNavegador:                       # página no meio de uma navegação
-                achou = None
+                html = ""
+            self.conferir_no_ar(None, html)
+            achou = condicao(html)
             if achou:
                 return achou
             frame, g = captcha_aberto(pagina, self.imagens)
@@ -604,14 +631,59 @@ class Pje:
                 frame.evaluate("() => document.getElementById('reload')?.click()")   # errou e não trocou a imagem
                 ultima = time.time()
             time.sleep(1)
-        raise ErroTecnico(f"PESQUISA_SEM_RESPOSTA: o PJe não respondeu em {ESPERA_PJE} s")
+        raise PjeInstavel(f"PESQUISA_SEM_RESPOSTA: o PJe não respondeu em {ESPERA_PJE} s")
 
-    def consultar(self, numero20):
-        """{resultado: OK|NAO_ENCONTRADO, capa, partes, advogados, completa} do processo pelo número."""
+    def consultar(self, numero20, tentativas=2):
+        """{resultado: OK|NAO_ENCONTRADO, capa, partes, advogados, completa} do processo pelo número. O PJe instável
+        trava pesquisas ao acaso (o mesmo processo abre na vez seguinte): sem resposta, recarrega e pesquisa de novo,
+        até `tentativas` vezes. A tela de indisponível não é repetida (o PJe está fora). Pesquisa sem resultado
+        (processo inexistente ou em segredo de justiça) também é repetida uma vez, para confirmar."""
+        for vez in range(1, tentativas + 1):
+            try:
+                dados = self.pesquisar(numero20)
+            except PjeInstavel as e:
+                if vez == tentativas or str(e).startswith("PJE_INDISPONIVEL"):
+                    raise
+                log.info(f"{formatar_cnj(numero20)}: {e}; pesquisando de novo")
+                try:                                    # a resposta atrasada da pesquisa travada ainda navega a
+                    self.pagina.goto("about:blank", timeout=15000)      # página e interromperia a nova pesquisa
+                except ErroNavegador:
+                    pass
+                time.sleep(PAUSA_PJE)
+                continue
+            if dados["resultado"] == "NAO_ENCONTRADO" and vez < tentativas:
+                log.info(f"{formatar_cnj(numero20)}: o PJe não achou o processo; pesquisando de novo para confirmar")
+                time.sleep(PAUSA_PJE)
+                continue
+            return dados
+
+    @staticmethod
+    def veio_vazia(respostas, lidas):
+        """A resposta AJAX da pesquisa trouxe a tabela de processos vazia ('processosGridCount':null e nenhum link de
+        detalhe): o PJe não achou o processo (não existe ou está em segredo de justiça). Hoje o TJBA não escreve
+        'não encontrou nenhum processo'; e a página inicial já vem com a tabela vazia, por isso vale só a resposta
+        da pesquisa. `lidas` guarda o corpo de cada resposta (lido uma vez só)."""
+        for r in respostas:
+            if r not in lidas:
+                try:
+                    lidas[r] = r.text()
+                except ErroNavegador:                   # corpo ainda não disponível: tenta na próxima volta
+                    continue
+            if RE_GRID_VAZIO.search(lidas[r]) and not RE_LINK_DETALHE.search(lidas[r]):
+                return True
+        return False
+
+    def pesquisar(self, numero20):
+        """Uma pesquisa, da tela de pesquisa ao detalhe lido (ver consultar)."""
         self.imagens.clear()
         pg = self.pagina
+        respostas, lidas = [], {}                       # respostas AJAX da pesquisa (POST no listView)
+
+        def guardar(resposta):
+            if resposta.request.method == "POST" and "/ConsultaPublica/listView.seam" in resposta.url:
+                respostas.append(resposta)
         try:
-            pg.goto(URL, wait_until="domcontentloaded", timeout=60000)
+            self.conferir_no_ar(pg.goto(URL, wait_until="domcontentloaded", timeout=60000), pg.content())
             campo = pg.locator(CAMPO_NUMERO)
             campo.wait_for(timeout=30000)
             campo.click()
@@ -619,19 +691,30 @@ class Pje:
             campo.press_sequentially(numero20, delay=40)
             if so_digitos(campo.input_value()) != numero20:
                 campo.fill(formatar_cnj(numero20))
+            pg.on("response", guardar)
             pg.locator(BOTAO_PESQUISAR).click()
-            achou = self.esperar(pg, lambda h: RE_LINK_DETALHE.search(h) or ("NADA" if RE_NADA.search(h) else None))
+            achou = self.esperar(pg, lambda h: RE_LINK_DETALHE.search(h) or (
+                "NADA" if RE_NADA.search(h) or self.veio_vazia(respostas, lidas) else None))
             if achou == "NADA":
                 return {"resultado": "NAO_ENCONTRADO"}
             det = pg.context.new_page()
             try:
-                det.goto(urljoin(BASE, achou.group(1)), wait_until="domcontentloaded", timeout=60000)
+                self.conferir_no_ar(det.goto(urljoin(BASE, achou.group(1)), wait_until="domcontentloaded",
+                                             timeout=60000), det.content())
                 self.esperar(det, lambda h: "processoPartesPoloAtivo" in h or "Polo ativo" in h)
                 return self.ler_detalhe(det)
             finally:
                 det.close()
         except ErroNavegador as e:
-            raise ErroTecnico(f"PROCESSO_NAO_CARREGOU: {str(e).splitlines()[0][:150]}") from e
+            motivo = f"PROCESSO_NAO_CARREGOU: {str(e).splitlines()[0][:150]}"
+            if re.search(r"closed|Target|browser", motivo, re.I):   # o navegador caiu: não é o PJe
+                raise ErroTecnico(motivo) from e
+            raise PjeInstavel(motivo) from e
+        finally:
+            try:
+                pg.remove_listener("response", guardar)
+            except Exception:                           # não chegou a ser ligado (erro antes do clique)
+                pass
 
     @staticmethod
     def ler_detalhe(det):
@@ -1396,6 +1479,7 @@ class Rodada:
         self.assume_fila = not simulacao and WORKER_N == 1
         self.bk = Backup(SAIDA / f"desfazer_legado_{self.rodada}.sql")      # só é escrito na execução real
         self.resultados, self.falhas_seguidas, self.falhas_gravacao, self.n, self.parar = Counter(), 0, 0, 0, False
+        self.pje_instavel, self.pausar, self.dono_da_pausa = 0, False, False     # instabilidade do PJe (pausa)
 
         self.con, self.con_l = conectar(escrita=True), conectar()
         with self.con.cursor() as cur:
@@ -1429,11 +1513,123 @@ class Rodada:
         log.info(f"fila assumida: {movidas} linhas do RPA passaram para o robô ({pendentes} sem credor, em PENDENTE)")
 
 
+# Pausa por instabilidade do PJe. Quem vê PJE_INSTAVEL_PARA_PAUSAR créditos seguidos com o PJe sem responder vira o
+# dono da pausa: marca em saida/pausa_pje.txt até quando os workers desta máquina param, espera e testa o PJe com a
+# SONDA_PJE; se ela abrir, apaga o arquivo e todos voltam; senão marca uma pausa mais longa (PAUSAS_PJE). Os outros
+# workers veem o arquivo antes de pegar o próximo crédito e esperam sem reservar nada. Arquivo de um dono que morreu
+# vale só até o fim marcado + FOLGA_PAUSA. Nenhum crédito fica preso: a pausa acontece entre um crédito e outro.
+ARQ_PAUSA = SAIDA / "pausa_pje.txt"
+
+
+def pausa_ate():
+    """Até quando (epoch) os workers desta máquina estão em pausa pelo PJe; 0 se não há pausa."""
+    try:
+        return float(ARQ_PAUSA.read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):          # sem arquivo, ou no meio de uma escrita
+        return 0.0
+
+
+def marcar_pausa(ate):
+    """Marca a pausa de todos os workers desta máquina até `ate` (epoch)."""
+    ARQ_PAUSA.write_text(f"{ate:.0f} {WORKER} {datetime.fromtimestamp(ate):%H:%M:%S}\n", encoding="utf-8")
+
+
+def tirar_pausa(rod):
+    """Apaga a marcação (o dono sai da pausa ou encerra)."""
+    ARQ_PAUSA.unlink(missing_ok=True)
+    rod.dono_da_pausa = False
+
+
+def pje_voltou(rod):
+    """A sonda abre duas vezes seguidas, sem a nova tentativa do consultar (um acerto só no PJe instável engana)."""
+    for _ in range(2):
+        try:
+            rod.pje.consultar(SONDA_PJE, tentativas=1)
+        except ErroTecnico as e:
+            log.info(f"sonda do PJe falhou: {e}")
+            if re.search(r"closed|Target|browser", str(e), re.I):
+                rod.pje.reabrir()
+            return False
+        time.sleep(PAUSA_PJE)
+    return True
+
+
+def reconectar_banco(rod):
+    """Depois de uma pausa longa a conexão ociosa pode ter caído: testa as duas e refaz a que não responder."""
+    for nome, escrita in (("con", True), ("con_l", False)):
+        con = getattr(rod, nome)
+        try:
+            with con.cursor() as cur:
+                cur.execute("SELECT 1")
+            if escrita:
+                con.commit()
+        except psycopg2.Error:
+            try:
+                con.close()
+            except psycopg2.Error:
+                pass
+            setattr(rod, nome, conectar(escrita=escrita))
+            log.info(f"conexão {'de escrita' if escrita else 'de leitura'} com o banco refeita depois da pausa")
+
+
+def pausar_por_instabilidade(rod):
+    """Dono da pausa: para os workers desta máquina e testa o PJe a cada pausa, até ele voltar ou somar
+    PAUSA_PJE_MAXIMA (aí o worker para, como antes)."""
+    rod.dono_da_pausa, pausado, vez = True, 0, 0
+    try:
+        while True:
+            espera = PAUSAS_PJE[min(vez, len(PAUSAS_PJE) - 1)]
+            vez += 1
+            if pausado + espera > PAUSA_PJE_MAXIMA:
+                log.error(f"PJe sem responder há {pausado // 60} min: robô parado.")
+                rod.parar = True
+                return
+            marcar_pausa(time.time() + espera)
+            log.warning(f"PJe instável: os workers desta máquina param por {espera // 60} min; depois testo o PJe "
+                        f"com o processo {formatar_cnj(SONDA_PJE)}")
+            time.sleep(espera)
+            pausado += espera
+            marcar_pausa(time.time() + FOLGA_PAUSA)     # os outros seguem esperando enquanto a sonda roda
+            if pje_voltou(rod):
+                log.info(f"PJe voltou a responder depois de {pausado // 60} min: os workers retomam")
+                reconectar_banco(rod)
+                return
+            log.warning("PJe continua sem responder")
+    finally:                                            # voltou, desistiu ou Ctrl+C: os outros não esperam mais
+        tirar_pausa(rod)
+        rod.pausar, rod.pje_instavel = False, 0
+
+
+def pausa_de_outro():
+    """Há uma pausa em vigor marcada por algum worker (a marcação de um dono que morreu vence com a folga)."""
+    ate = pausa_ate()
+    return bool(ate) and time.time() <= ate + FOLGA_PAUSA
+
+
+def esperar_pausa_de_outro(rod):
+    """Outro worker está em pausa pelo PJe: espera ele terminar (ou a marcação vencer), sem reservar crédito."""
+    ate = pausa_ate() or time.time()                    # a marcação pode ter sido apagada agora mesmo
+    log.warning(f"PJe instável (pausa marcada por outro worker até {datetime.fromtimestamp(ate):%H:%M}): esperando")
+    inicio = time.time()
+    while pausa_de_outro():
+        time.sleep(15)
+    log.info(f"pausa terminou depois de {(time.time() - inicio) // 60:.0f} min: voltando")
+    rod.pausar, rod.pje_instavel = False, 0
+    reconectar_banco(rod)
+
+
 def proximo_credito(rod):
     """Id do próximo crédito, ou None para parar (amostra acabou, fila vazia, --limite, parada por falhas).
+    Antes, pausa se o PJe está instável: espera a pausa que outro worker marcou, ou vira o dono de uma.
     Fora da simulação reserva o crédito com lease e, no worker 1, a cada ASSUMIR_A_CADA assume de novo a fila do RPA."""
     if rod.parar or (rod.limite and rod.n >= rod.limite):
         return None
+    if pausa_de_outro():
+        esperar_pausa_de_outro(rod)
+    elif rod.pausar:
+        pausar_por_instabilidade(rod)
+        if rod.parar:                                   # somou PAUSA_PJE_MAXIMA sem o PJe voltar
+            return None
     if rod.simulacao:
         return rod.fila_simulada.pop(0) if rod.fila_simulada else None
     if rod.assume_fila and time.time() - rod.ultima_assumida > ASSUMIR_A_CADA:
@@ -1446,8 +1642,9 @@ def proximo_credito(rod):
 
 def processar_credito(rod, credito_id):
     """Lê o crédito no banco e decide originário e credor (DJEN + PJe), sem gravar nada. Devolve o item a gravar
-    ({lead, r, segundos}). Erro passageiro: devolve o crédito para a fila, registra ADIADO no log e devolve None;
-    MAX_FALHAS_SEGUIDAS erros seguidos param o robô."""
+    ({lead, r, segundos}). Erro passageiro: devolve o crédito para a fila, registra ADIADO no log e devolve None.
+    PJe instável não conta como falha: PJE_INSTAVEL_PARA_PAUSAR créditos seguidos assim pedem a pausa dos workers
+    (proximo_credito); MAX_FALHAS_SEGUIDAS outros erros seguidos param o robô."""
     rod.n += 1
     inicio = time.time()
     try:
@@ -1458,23 +1655,31 @@ def processar_credito(rod, credito_id):
         tecnico = isinstance(e, ErroTecnico)
         motivo = str(e) if tecnico else \
             f"ERRO_DESCONHECIDO: {e.__class__.__name__}: {(str(e).splitlines() or [''])[0][:200]}"
-        rod.falhas_seguidas += 1
+        if isinstance(e, PjeInstavel):
+            rod.pje_instavel += 1
+        else:
+            rod.falhas_seguidas += 1
         if not rod.simulacao:
             devolver(rod.con, credito_id, motivo)
         rod.resultados["ADIADO"] += 1
         log.warning(f"[{rod.n}] {credito_id} -> ADIADO: {motivo}", exc_info=not tecnico)  # inesperado: traceback
         if re.search(r"closed|Target|browser", motivo, re.I):
             rod.pje.reabrir()
+        if rod.pje_instavel >= PJE_INSTAVEL_PARA_PAUSAR:
+            rod.pausar = True
         if rod.falhas_seguidas >= MAX_FALHAS_SEGUIDAS:
-            log.error(f"{MAX_FALHAS_SEGUIDAS} falhas técnicas seguidas: robô parado (PJe/DJEN fora ou bloqueando).")
+            log.error(f"{MAX_FALHAS_SEGUIDAS} falhas técnicas seguidas: robô parado (DJEN fora, captcha ou erro).")
             rod.parar = True
         return None
-    rod.falhas_seguidas = 0
+    rod.falhas_seguidas = rod.pje_instavel = 0
     return {"lead": lead, "r": r, "segundos": round(time.time() - inicio)}
 
 
 def encerrar(rod):
-    """Fecha o Chrome e as conexões e registra o resumo (fila vazia, --limite, Ctrl+C, parada por falhas)."""
+    """Fecha o Chrome e as conexões e registra o resumo (fila vazia, --limite, Ctrl+C, parada por falhas).
+    Dono de uma pausa que sai (Ctrl+C) apaga a marcação, para os outros workers não esperarem à toa."""
+    if rod.dono_da_pausa:
+        tirar_pausa(rod)
     try:
         rod.pje.fechar()
     finally:
