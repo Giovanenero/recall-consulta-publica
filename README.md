@@ -10,6 +10,8 @@ da Recall (schema `creditos` e tabelas legadas). Cada tribunal tem uma pasta com
 | `TJBA/` | `fetch_TJBA.py` | API do DJEN + PJe 1º grau (captcha Tencent) | Sim | [TJBA/README.md](TJBA/README.md) |
 | `TJRN/` | `esteira_TJRN.py` + `fetch_TJRN.py` | PJe 1º grau (Akamai + reCAPTCHA) | **Não** (só CSV) | [TJRN/README.md](TJRN/README.md) |
 | `TJMA/` | `fetch_TJMA.py` | — | — | arquivo vazio (ainda não começou) |
+| `TJRJ/` | `fetch_TJRJ.py` | API da consulta processual (DCP) + PJe 1º grau + eJUD 2º grau (Chrome por CDP) + portal de precatórios, sem A3 | Sim | [TJRJ/README.md](TJRJ/README.md) |
+| `TJMT/` | `fetch_TJMT.py` | API do DJEN (iniciais do credor e advogados) + API da consulta processual do TJMT (processos do advogado, com CPF), sem A3 | Sim | [TJMT/README.md](TJMT/README.md) |
 | `utils/` | código comum | — | — | abaixo |
 
 `utils/cloudflare.py` é um teste à parte (Turnstile do eproc da JFRJ) e não é usado pelos robôs.
@@ -21,7 +23,7 @@ da Recall (schema `creditos` e tabelas legadas). Cada tribunal tem uma pasta com
 - **Simulação x gravação**: TJAL e TJBA têm `--simulacao`, que faz tudo (inclusive as escritas no banco) e dá
   `ROLLBACK` no fim — use sempre antes de uma gravação real. Sem a flag, o robô grava (`COMMIT`).
 - **Credenciais**: `.env` na raiz (modelo sem valores em `.env.shared`): `PG_HOST`, `PG_PORT`, `PG_DATABASE`,
-  `PG_USER`, `PG_PASSWORD`; `LOTE_GRAVACAO_TJMA` (TJMA). `PROXY_01..05` (`host:porta:usuário:senha`, saindo pelo Brasil): saídas extras para o
+  `PG_USER`, `PG_PASSWORD`; `LOTE_GRAVACAO_TJMA` (TJMA); `LOTE_GRAVACAO_TJRJ` (TJRJ); `LOTE_GRAVACAO_TJMT` (TJMT). `PROXY_01..05` (`host:porta:usuário:senha`, saindo pelo Brasil): saídas extras para o
   DJEN no TJMA (`--proxies`) e nos workers 2 em diante do TJBA (`--workers N` num terminal só, ou `--worker N`).
 - **Log padrão** (`utils/log.py`): mesma linha no terminal e em `<PASTA>/saida/logs/<robo>_AAAAMMDD.log`:
   ```

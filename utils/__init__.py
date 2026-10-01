@@ -1,5 +1,5 @@
 """
-utils - código comum aos robôs de consulta pública (TJAL, TJBA, TJRN).
+utils - código comum aos robôs de consulta pública (TJAL, TJBA, TJMA, TJRJ, TJRN).
 
     log.py      log padrão: mesmo formato no terminal e em <TRIBUNAL>/saida/logs/<script>_AAAAMMDD.log
     banco.py    conexão com o Postgres (.env da raiz) e consultas que mais de um robô usa
