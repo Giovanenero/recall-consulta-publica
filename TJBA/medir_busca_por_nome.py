@@ -51,6 +51,20 @@ def e_ente(nome):
     return any(t in normal(nome).upper() for t in ENTE)
 
 
+# Marcas de pessoa JURÍDICA. Separar do resultado não é capricho: empresa grande
+# devolve dezenas de processos e nenhum critério simples diz qual é o certo
+# (CLARO S.A. trouxe 30). Misturar com pessoa física esconde exatamente a
+# fraqueza da rota.
+EMPRESA = (" S.A", " S/A", " SA ", "LTDA", "EIRELI", " ME ", " EPP", "SOCIEDADE",
+           "ADVOGADOS", "COMERCIO", "COMÉRCIO", "INDUSTRIA", "INDÚSTRIA", "SERVICOS",
+           "SERVIÇOS", "EMPRESA", "COMPANHIA", "TRANSPORTE", "CONSTRU", " & ", ",")
+
+
+def e_empresa(nome):
+    u = f" {normal(nome).upper()} "
+    return any(t in u for t in EMPRESA)
+
+
 def linhas_do_resultado(html):
     """[(link, numero)] da tabela de resultados, sem repetir."""
     saida, vistos = [], set()
@@ -163,7 +177,7 @@ def main():
                 r = {"veredito": "INSTAVEL", "erro": str(e)[:70]}
             except Exception as e:
                 r = {"veredito": "ERRO", "erro": f"{type(e).__name__}: {str(e)[:60]}"}
-            r.update(prec=caso["prec"], nome=caso["nome"])
+            r.update(prec=caso["prec"], nome=caso["nome"], empresa=e_empresa(caso["nome"]))
             resultados.append(r)
             print(f"[{i}/{len(casos)}] {caso['nome'][:30]:<30} {r['veredito']:<15} "
                   f"{r.get('originario','')} {r.get('documento','')}", flush=True)

@@ -1,8 +1,10 @@
-# TJBA — achar o originário pesquisando o PJe por NOME
+# TJBA — achar o originário sem depender do DJEN
 
-Investigação de 30/09/2026 sobre os créditos do TJBA que ficam sem credor.
-Nada aqui altera o `fetch_TJBA.py`: são **testes de leitura** e a medição que
-justifica (ou não) mexer nele depois.
+Investigação de 30/09 e 01/10/2026. Nada aqui altera o `fetch_TJBA.py`: são
+**scripts de leitura** e as medições que justificam (ou não) mexer nele depois.
+
+> **Se for ler uma coisa só, leia "O número que importa" e "Como medir sem se
+> enganar".** O resto é o caminho até lá.
 
 ---
 
@@ -12,26 +14,29 @@ Base do TJBA: **40.378 créditos**.
 
 | campo | temos |
 |---|---|
-| Número do precatório, ente devedor, ano, natureza, data | 100% |
-| Valor | 97,7% |
-| **Processo originário** | **17,8%** (7.204) |
-| **Credor** | **17,8%** (7.173) |
-| **CPF/CNPJ** | **16,2%** (6.535) |
-| Advogado | 17,7% |
+| Número do precatório, ente devedor, ano, valor | 100% |
+| **Processo originário** | **18%** (7.256) |
+| **Credor** | **18%** (7.224) |
+| **CPF/CNPJ** | **16%** (6.586) |
+| Advogado | 18% |
 
 Os quatro últimos andam juntos de propósito: **não são quatro problemas, é um**.
-Assim que o originário aparece, o credor vem em 99,6% dos casos, o advogado em
-99% e o CPF em 91%. Achar o originário é a tarefa inteira.
+Com o originário, o credor vem em 99,6% dos casos, o advogado em 99% e o CPF em
+91%. Achar o originário é a tarefa inteira.
 
-O robô já passou uma vez pela base:
+Estado da fila (software `CONSULTA_PUBLICA_TJBA`):
 
 ```
-SUCESSO   13.069   56%
-FALHA     10.240   44%
-PENDENTE  17.069
+PENDENTE                      17.069    nunca tentados
+FALHA                         10.240
+SUCESSO_PARTES_SEM_VALOR       7.413
+SUCESSO_ANALISAR               5.103    achou, não desempatou, espera humano
+SUCESSO_PROCESSO_ORIGINARIO      553
 ```
 
-E as falhas:
+Taxa real do robô sobre o que já processou: **56% de sucesso**.
+
+Dentro das 10.240 falhas:
 
 ```
 6.244  PROCESSO_NAO_ENCONTRADO
@@ -40,14 +45,12 @@ E as falhas:
   536  SEM_BENEFICIARIO
 ```
 
-Dentro das 6.244: **4.380** sem candidato no DJEN nem pista, **1.008** não
+E dentro das 6.244: **4.380** sem candidato no DJEN nem pista, **1.008** não
 achadas no PJe, **857** com candidato recusado pela regra.
 
 ---
 
 ## Por que o robô perde esses casos
-
-O fluxo de hoje é:
 
 ```
 nome do credor (banco)
@@ -57,8 +60,8 @@ nome do credor (banco)
    -> CPF
 ```
 
-O DJEN cobre de meados de 2025 em diante. **Originário anterior a isso não
-existe lá**, e o robô encerra como "nenhum candidato".
+O DJEN cobre de meados de 2025 em diante. **Originário anterior não existe lá**,
+e o robô encerra como "nenhum candidato".
 
 Uma hipótese testada e descartada: achei que faltasse o nome do credor. Não
 falta — `requerentes` está preenchido em 40 de 40 da amostra. O nome está lá; o
@@ -66,7 +69,7 @@ que falta é onde procurar com ele.
 
 ---
 
-## A rota nova
+## A rota nova: perguntar ao tribunal, não ao diário
 
 A tela de pesquisa do PJe público aceita muito mais do que o robô usa:
 
@@ -75,12 +78,9 @@ Processo · Processo referência · Nome da Parte · Nome do advogado
 Classe judicial · CPF CNPJ · OAB · Data de autuação
 ```
 
-O robô só preenche **Processo**. O campo `fPP:dnp:nomeParte` e o
-`fPP:dpDec:documentoParte` nunca são tocados (conferido por busca no código: a
-única ocorrência de `nomeParte` no `fetch_TJBA.py` é a do **DJEN**, na linha
-365).
-
-A rota proposta inverte a ordem:
+O robô só preenche **Processo**. Os campos `fPP:dnp:nomeParte` e
+`fPP:dpDec:documentoParte` nunca são tocados — a única ocorrência de `nomeParte`
+no `fetch_TJBA.py` (linha 365) é do **DJEN**.
 
 ```
 nome do credor (banco)
@@ -89,90 +89,129 @@ nome do credor (banco)
    -> CPF
 ```
 
-O DJEN não some: continua bom para desempatar quando aparecem vários
-candidatos.
+O DJEN não some: continua ótimo para desempatar.
 
 ### O que o detalhe devolve
 
-Tudo o que o robô procura, numa página só:
-
 ```
-A. M. S. S.   REQUERENTE  ATIVO    CPF  098.***.***-15
-C. T. G. S.      ADVOGADO    ATIVO    OAB BA 36025
+A. M. S. S.                     REQUERENTE  ATIVO    CPF  098.***.***-15
+C. T. G. S.                     ADVOGADO    ATIVO    OAB BA 36025
 SECRETARIA DA SAÚDE DA BAHIA    REQUERIDO   PASSIVO  CNPJ 00.***.***/0001-**
-ESTADO DA BAHIA                 REQUERIDO   PASSIVO  CNPJ 00.***.***/0001-**
-
 classe: CUMPRIMENTO DE SENTENÇA CONTRA A FAZENDA PÚBLICA · autuado 15/03/2013
 ```
 
-CPF **completo, sem máscara** — do credor e do advogado. Vale registrar o
-contraste com o TJSP, onde nenhuma via pública expõe documento (vedação do
-art. 12, §3º da Resolução CNJ 303/2019). Na Bahia o PJe mostra.
+CPF completo, sem máscara — do credor e do advogado. Contraste com o TJSP, onde
+nenhuma via pública expõe documento (art. 12, §3º da Resolução CNJ 303/2019).
 
-A lista de resultados, porém, é pobre: só **Processo** e **Última
-movimentação**. Todo o valor está no detalhe, e abrir detalhe é o que custa
-tempo.
+A **lista** de resultados é pobre: só Processo e Última movimentação. Todo o
+valor está no detalhe, e abrir detalhe é o que custa tempo.
 
 ---
 
-## A medição
+## O número que importa
 
-Critério de ACERTO, deliberadamente apertado. Um caso só conta quando existe um
-processo que:
+Medido contra GABARITO — créditos que já têm originário conhecido no banco, para
+comparar a escolha com a resposta certa.
 
-- é de 1º grau do TJBA (foro != 0000) e não é o próprio precatório;
-- não é mais novo que o precatório;
-- tem o **credor no polo ATIVO** e não como advogado;
-- tem **ente público no polo PASSIVO**;
-- e traz o CPF/CNPJ do credor.
+```
+decisões tomadas     98
+acertos              98
+FALSO POSITIVO        0
 
-Falha de rede do PJe conta em `INSTAVEL` e **fica fora do denominador**.
-Misturar instabilidade com "não encontrado" é o erro que faz uma rota boa
-parecer ruim.
+PRECISÃO    100%   (quando decide, acerta)
+COBERTURA    51%   (resolve metade; na outra metade, cala)
+```
 
-### O resultado — e o erro de método que quase o enterrou
+**A precisão é o ativo, não a cobertura.** Crédito ligado ao processo errado
+traz o CPF de outra pessoa e entra na base com cara de dado bom. Não decidir
+custa um lead; decidir errado contamina a base. Qualquer mudança futura precisa
+manter o zero.
 
-A primeira medição deu **15%**. Estava errada: foi feita sobre o **resíduo** —
-os 4.380 créditos onde o robô **já tinha tentado e desistido**. Por construção é
-o grupo mais difícil da base. Comparar isso com a taxa geral do robô é comparar
-populações diferentes.
+### Como ele decide
 
-Refeita sobre a fila de verdade (créditos nunca tentados, `status_id = 1`), a
-mesma rota e o mesmo código:
+Nenhum sinal decide sozinho, porque nenhum prova sozinho:
 
-| população | acerto |
+- o **nome** não basta: existe homônimo, e a mesma pessoa costuma ter várias
+  ações contra a Fazenda;
+- a **OAB** não basta: o mesmo advogado pode ter entrado com DUAS ações
+  diferentes para o MESMO cliente;
+- o **estrutural** (credor no ativo, ente no passivo) não basta: casa com
+  qualquer ação dela contra ente público.
+
+Daí a pontuação com corroboração:
+
+| sinal | peso |
 |---|---|
-| resíduo (o robô já desistiu) | 2/13 = **15%** |
-| fila de verdade (nunca tentados) | 30/35 = **86%** |
+| valor do precatório ou o próprio número citados na publicação | 4 |
+| advogado em comum com o precatório | 2 |
+| credor no polo ativo + ente no passivo | 1 |
+| ação anterior ao precatório | 1 |
 
-Comparando com a mesma população:
+Aceita com **3 pontos** — ou a prova dura, ou dois indícios independentes. E
+exige **vantagem**: o primeiro tem de estar à frente do segundo; empate no topo
+significa dois candidatos igualmente plausíveis, e aí não se escolhe.
+
+Candidato único exige 2: com um só na mesa não há com quem confundir, então o
+risco de *escolher errado* não existe.
+
+O que decidiu, na prática:
 
 ```
-robô hoje (DJEN + PJe por número)   56%
-busca por nome no PJe               86%
+oab + estrutura + data          30
+oab + data                      12
+forte + oab + estrutura + data   6
+forte + estrutura + data         2
 ```
 
-Exemplos de acerto, com o originário e o documento:
+**A OAB aparece em quase tudo.** A evidência que o robô usa hoje — valor ou
+número citados — resolveu só 8 de 50: é rara demais para carregar sozinha.
+
+---
+
+## Como medir sem se enganar
+
+Três medições deram errado antes de uma dar certo, e **os três erros inflavam o
+resultado**. Vale mais que o número final:
+
+**1. População errada.** Medi a rota nova sobre o RESÍDUO — os créditos onde o
+robô já tinha tentado e desistido. É o grupo mais difícil por construção. Deu
+15%. Na fila de verdade, o mesmo código deu 86%. Por isso
+`medir_busca_por_nome.py` recebe o grupo como argumento (`residuo` | `pendente`).
+
+**2. Sem gabarito.** Os "86%" contavam como acerto qualquer processo da pessoa
+contra a Fazenda, sem verificar se era o processo CERTO. Com gabarito, o acerto
+real era 32% — em 57% dos casos ele pegava outra ação da mesma pessoa.
+
+**3. Paralelismo disfarçado de ausência.** Com 6 buscas simultâneas o PJe
+devolve o formulário em branco, que parece "não encontrado". Deu 22% onde era
+97%. Instabilidade **nunca** entra no denominador.
+
+---
+
+## Busca por CPF
+
+Para os ~6.586 créditos onde o documento já está no banco. Medido em 20 casos
+com gabarito, comparando as duas buscas no MESMO crédito:
 
 ```
-C. C. X.        8003646-40.2018.8.05.0193   CPF 128.***.***-44
-M. C. S.        8001145-39.2019.8.05.0271   CPF 726.***.***-25
-C. R. S.   0000012-42.1986.8.05.0114
-P. P. S.        0700012-16.1967.8.05.0001   CPF 541.***.***-68
+CPF trouxe o certo    20/20 = 100%
+NOME trouxe o certo   20/20 = 100%
+candidatos por busca:  CPF 3,4  x  NOME 4,0
 ```
 
-**1986 e 1967** — décadas fora do alcance do DJEN. É exatamente o buraco que a
-rota fecha.
+Mesmo acerto, **menos candidatos** — e candidato a menos é empate a menos, que é
+onde o critério se cala. Os casos individuais mostram melhor que a média:
 
-### Limites do número
+```
+MARIA MARTINS LIMA   CPF  2  x  NOME 10
+EDMILSON CHELLES     CPF  3  x  NOME  5
+```
 
-- **35 casos respondidos.** A margem é larga; o valor real está em algum ponto
-  entre ~70% e ~95%. Antes de mexer no robô, vale rodar ~100.
-- **Empresa não funciona.** Os poucos erros são todos pessoa jurídica —
-  `CLARO S.A.` trouxe 30 processos, `ARCELORMITTAL` idem, e nenhum critério
-  simples separa qual é o certo. Pessoa física acertou quase tudo.
-- **O PJe do TJBA anda instável** (pesquisa que não volta em 90 s). Perdeu-se de
-  12 a 15% da amostra por isso, em dias diferentes.
+Ressalva: rodou em créditos que já têm CPF, ou seja, os que o robô já resolveu —
+população mais fácil. O resultado válido aqui não é a taxa, é a **comparação**.
+
+Conclusão: onde há documento, o CPF deve ser o primeiro caminho; o nome fica
+para os outros 84%.
 
 ---
 
@@ -180,50 +219,58 @@ rota fecha.
 
 | fonte | veredito |
 |---|---|
-| **DJEN pelo número do precatório** | 55% têm publicação, mas **0%** traz "Processo de Origem" (diferente do TJSP). E só 25% trazem nome completo de pessoa — o resto vem `A. M. D. S. E. S.`; os nomes cheios são empresas e órgãos |
-| **DataJud (CNJ)** | devolve o precatório com classe, órgão e movimentos, **sem partes e sem origem**. O único CNJ no retorno é o do próprio precatório |
+| **DJEN pelo número do precatório** | 55% têm publicação, mas **0%** traz "Processo de Origem" (diferente do TJSP). Só 25% trazem nome completo de pessoa — o resto vem `A. M. D. S. E. S.`; os nomes cheios são empresas e órgãos |
+| **DataJud (CNJ)** | classe, órgão e movimentos, **sem partes e sem origem** |
 | **PJe 1º grau, pelo número do precatório** | 12 de 12 `NAO_ENCONTRADO` |
-| **PJe 2º grau** (`pje2g.tjba.jus.br`) | 12 de 12 `NAO_ENCONTRADO`, inclusive um precatório que o próprio robô resolveu. Precatório do TJBA tramita no Núcleo Auxiliar de Conciliação e Precatórios, fora da consulta aberta |
-| **Lista Unificada** (`listaprecatorios.tjba.jus.br`) | atrás de reCAPTCHA, e os filtros são devedor / número / natureza / ordem / superpreferência — **sem nome e sem CPF**. Não traz credor. A API é `listaprecatoriosws.tjba.jus.br`; só `/api/entidade-devedora/` responde aberto (416 entidades) |
+| **PJe 2º grau** (`pje2g.tjba.jus.br`) | 12 de 12 `NAO_ENCONTRADO`, inclusive um precatório que o robô resolveu. Precatório do TJBA tramita no Núcleo Auxiliar de Conciliação e Precatórios, fora da consulta aberta |
+| **Lista Unificada** (`listaprecatorios.tjba.jus.br`) | reCAPTCHA, e filtra por devedor/número/natureza/ordem — **sem nome e sem CPF**. A API é `listaprecatoriosws.tjba.jus.br`; só `/api/entidade-devedora/` responde aberto (416 entidades) |
 
 Registrado para ninguém refazer.
 
 ---
 
-## Ainda não testado
+## O que falta para virar fluxo
 
-**Busca por CPF no PJe** (`fPP:dpDec:documentoParte`). Para os **6.535**
-créditos onde já temos o documento, ela é exata — sem risco de homônimo, que é
-justamente o que derruba os casos de empresa. É o próximo passo óbvio.
-
-**Originário que já está na lista antiga.** `numero_originario` está preenchido
-em 8.503 das 45.556 linhas do TJBA (19%), e — ao contrário do TJPR — **sem
-máscara e sem repetir o próprio precatório**: zero em ambas as verificações. Os
-números são plausíveis, de 1º grau e foro real. Vale medir quantos desses ainda
-não foram aproveitados: seria dado de graça, já no banco.
+- **Não está no robô.** Tudo vive nestes scripts; nenhuma linha do
+  `fetch_TJBA.py` foi alterada.
+- **Não grava.** Todos são só leitura.
+- **49% sem resposta.** Dos 98 casos, 43 tinham o certo entre os candidatos e o
+  critério calou. É o estoque a atacar — sem criar risco, porque já estão lá.
+  O caminho mais promissor é refinar a **data**: hoje só compara o ano.
+- **Velocidade.** ~40 s por caso (navegador + captcha). Para 33 mil créditos
+  isso é mês, não semana. O robô já tem workers e proxy, mas ninguém dimensionou
+  com a rota nova.
+- **8.503 originários na lista antiga**, dos quais só 466 viraram vínculo. Pode
+  ser dado de graça parado — não medido.
+- **1.915 falhas por sessão expirada**: recupera só reprocessando.
 
 ---
 
 ## Os scripts
 
-Todos **só leem**. Nenhum grava no banco, nenhum altera o `fetch_TJBA.py`; eles
-importam a classe `Pje` dele, então herdam o captcha, o perfil do Chrome e o
-tratamento de instabilidade.
+Todos **só leem**. Importam a classe `Pje` do `fetch_TJBA`, então herdam o
+captcha, o perfil do Chrome e o tratamento de instabilidade.
 
 | script | o que faz |
 |---|---|
-| `teste_busca_por_nome.py` | prova de conceito: pesquisa 5 nomes e lista os candidatos |
+| `teste_busca_por_nome.py` | prova de conceito: pesquisa nomes e lista candidatos |
 | `teste_campos_por_nome.py` | mostra QUAIS campos a busca e o detalhe devolvem |
-| `medir_busca_por_nome.py` | **a medição**: taxa de acerto com critério apertado |
-| `teste_precatorio_no_pje.py` | testa o precatório no PJe de 1º grau (deu 0%) |
+| `medir_busca_por_nome.py` | taxa de acerto por critério estrutural (sem gabarito) |
+| **`validar_busca_por_nome.py`** | **com GABARITO**: mede o falso positivo da busca por nome |
+| **`validar_combinado.py`** | **a rota completa**: DJEN + nome + pontuação. É o que vale |
+| `teste_busca_por_cpf.py` | compara busca por CPF x por nome, no mesmo crédito |
+| `teste_precatorio_no_pje.py` | precatório no PJe 1º grau (deu 0%) |
 | `teste_pje_2grau.py` | idem no 2º grau, trocando só `BASE`/`URL` (deu 0%) |
 
 ```bash
-python TJBA/medir_busca_por_nome.py 60 pendente   # fila de verdade
-python TJBA/medir_busca_por_nome.py 25 residuo    # o que o robô já descartou
+python TJBA/validar_combinado.py 100        # a medição que importa
+python TJBA/teste_busca_por_cpf.py 20       # CPF x nome
+python TJBA/medir_busca_por_nome.py 60 pendente
 ```
 
-O segundo argumento existe justamente para não repetir o erro de medir a rota
-no grupo errado.
+O `validar_combinado.py` gera **`saida/conferencia_manual.csv`**: uma linha por
+caso com o que escolheu, a resposta conhecida, se bateu e a evidência usada —
+com o número formatado, pronto para colar na consulta pública e conferir à mão.
+O resultado não deve depender de acreditar no script.
 
 Saídas em `TJBA/saida/` (fora do git: têm CPF).
