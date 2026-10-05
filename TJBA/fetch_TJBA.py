@@ -126,6 +126,12 @@ TENTATIVAS_CAPTCHA = 4
 MAX_ABERTOS_PJE = 10                   # candidatos abertos no PJe por crédito
 MAX_PAGINAS_PARTES = 50
 PAUSA_PJE = 2
+CAMPO_NOME = "[id='fPP:dnp:nomeParte']"
+MAX_NOMES_PJE = 2                      # pesquisas por nome da parte (1 captcha cada) por crédito
+MAX_DETALHES_HTTP = 30                 # detalhes abertos pelo link ?ca= (HTTP, sem captcha) por crédito
+MAX_LINKS_GUARDADOS = 50000            # links ?ca= guardados na memória do worker (os mais velhos saem)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 "
+      "Safari/537.36")
 
 CNJ = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
 RE_ESPOLIO_REP = re.compile(r"^\s*esp[oó]lio\s+(?:de\s+)?(?P<falecido>.+?)\s+(?:rep\.?|representad[oa])\s+"
@@ -141,6 +147,14 @@ RE_ORGAO_PUBLICO = re.compile(r"^(?:ESTADO D|MUNICIPIO D|UNIAO\b|DISTRITO FEDERA
 RE_LINK_DETALHE = re.compile(r"(/pje/ConsultaPublica/DetalheProcessoConsultaPublica/listView\.seam\?ca=[^'\"\s<>]+)")
 RE_NADA = re.compile(r"n[ãa]o\s+encontrou\s+nenhum\s+processo", re.I)
 RE_GRID_VAZIO = re.compile(r"'processosGridCount'\s*:\s*null")    # tabela de resultados vazia (resposta da pesquisa)
+RE_CAPTCHA_ERRADO = re.compile(r"verifica[çc][ãa]o\s+de\s+captcha\s+n[ãa]o\s+est[áa]\s+correta", re.I)
+RE_LINHA = re.compile(r"<tr[^>]*rich-table-row[^>]*>(.*?)</tr>", re.S)            # linha da tabela de resultados
+RE_GRID_COM_LINHAS = re.compile(r"'processosGridCount'\s*:\s*[1-9]")
+RE_TOTAL = re.compile(r"(\d+)\s+resultados?\s+encontrad", re.I)
+# Paginador (RichFaces datascroller) das tabelas de partes do detalhe: id, formulário e URL do POST AJAX.
+RE_SCROLLER = re.compile(r"Datascroller\('([^']+)',\s*function\(event\)\{A4J\.AJAX\.Submit\('([^']+)'.*?"
+                         r"'actionUrl':'([^']+)'", re.S)
+RE_VIEWSTATE = re.compile(r'name="javax\.faces\.ViewState"[^>]*value="([^"]*)"')
 # Páginas de erro do TJBA quando o PJe está fora: a tela "SISTEMA TEMPORARIAMENTE INDISPONÍVEL" e os 502/503/504.
 RE_PJE_FORA = re.compile(r"SISTEMA\s+TEMPORARIAMENTE\s+INDISPON|\b50[234]\s+(?:Bad\s+Gateway|Service\s+"
                          r"(?:Temporarily\s+)?Unavailable|Gateway\s+Time-?out)", re.I)
@@ -373,6 +387,14 @@ class Djen:
         return self.buscar(True, numeroProcesso=numero20)
 
 
+def nao_mais_novo(n, prec20):
+    """O processo n (CNJ de 20 dígitos) não é de ano posterior ao do precatório. Precatório com número fora do
+    padrão CNJ no banco (ex.: '0011745-06', sem o ano): não dá para comparar e o filtro não se aplica."""
+    if len(prec20) != 20 or not prec20.isdigit():
+        return True
+    return int(n[9:13]) <= int(prec20[9:13])
+
+
 def candidatos_djen(djen, lead, nomes, chaves):
     """([(cnj20, {classe, valor, oabs})], vezes como advogado): processos com o beneficiário no polo ativo e o ente
     no passivo, anteriores ao precatório; cumprimento/execução e os mais novos primeiro. O DJEN põe os advogados no
@@ -390,7 +412,7 @@ def candidatos_djen(djen, lead, nomes, chaves):
             p["ente"] |= polo == "P" and any(c in normal(nome) for c in chaves)
     cands = {n: p for n, p in procs.items()
              if len(n) == 20 and n != prec20 and n[13:16] == "805" and n[16:20] != "0000"
-             and int(n[9:13]) <= int(prec20[9:13]) and p["ativo"] and (p["ente"] or not chaves)}
+             and nao_mais_novo(n, prec20) and p["ativo"] and (p["ente"] or not chaves)}
     ordem = sorted(cands, key=lambda n: (not CLASSE_EXECUCAO.search(cands[n]["classe"]), -int(n[9:13])))
     valores = set().union(*(formatos_valor(v) for v in lead["valores"])) if lead["valores"] else set()
     saida = []
@@ -404,6 +426,16 @@ def candidatos_djen(djen, lead, nomes, chaves):
                         oabs={a["oab"] + a["uf"] for x in itens for a in x["advogados"]})
         saida.append((n, info))
     return saida, como_advogado
+
+
+def candidatos_do_nome(do_nome, prec20, chaves):
+    """Processos da pesquisa por nome no PJe ({cnj20: linha}) com o ente no polo passivo da linha ('ATIVO X
+    PASSIVO'), anteriores ao precatório; cumprimento/execução e os mais novos primeiro. O beneficiário no polo ativo
+    é conferido no detalhe (a linha mostra só a 1ª parte de cada polo)."""
+    cands = [n for n, texto in do_nome.items()
+             if n != prec20 and n[13:16] == "805" and n[16:20] != "0000" and nao_mais_novo(n, prec20)
+             and (not chaves or any(c in texto.split(" X ", 1)[-1] for c in chaves))]
+    return sorted(cands, key=lambda n: (not CLASSE_EXECUCAO.search(do_nome[n]), -int(n[9:13])))
 
 
 def oabs_do_precatorio(djen, prec20):
@@ -494,6 +526,38 @@ def campos_da_capa(html):
     return out
 
 
+def dados_do_detalhe(html, partes, completa, via):
+    """Resultado de um detalhe lido (no navegador ou por HTTP): capa, partes e advogados sem repetição."""
+    unicas = list({(p["nome"], p["documento"], p["papel"], p["polo"]): p for p in partes}.values())
+    return {"resultado": "OK", "capa": campos_da_capa(html), "completa": completa, "via": via,
+            "partes": [p for p in unicas if not RE_ADVOGADO.search(p["papel"])],
+            "advogados": [p for p in unicas if RE_ADVOGADO.search(p["papel"])]}
+
+
+def linha_da_tabela(html_linha):
+    """Texto normalizado de uma linha da tabela de resultados: classe, número, assunto, 'ATIVO X PASSIVO'."""
+    texto = normal(re.sub(r"<[^>]+>", " ", H.unescape(html_linha)))
+    return re.sub(r"^VER DETALHES DO PROCESSO ", "", texto)
+
+
+def linha_confere(texto, alvo, chaves):
+    """A linha sem detalhe mostra o beneficiário como 1ª parte do polo ativo e o ente no polo passivo?"""
+    if " X " not in texto:
+        return False
+    ativo, passivo = texto.rsplit(" X ", 1)
+    return any(re.search(r"\b" + re.escape(a) + r"\b", ativo) for a in alvo if a) and \
+        (not chaves or any(c in passivo for c in chaves))
+
+
+def paginas_do_scroller(html, scroller):
+    """Maior número de página que o paginador da tabela mostra (1 se não tem paginador)."""
+    ini = html.find(f'id="{scroller}"')
+    fim = html.find(f"Datascroller('{scroller}'", ini)
+    if ini == -1 or fim == -1:
+        return 1
+    return max([int(n) for n in re.findall(r">\s*(\d+)\s*</td>", html[ini:fim])] + [1])
+
+
 def captcha_aberto(pagina, imagens):
     """(frame, geometria) do captcha visível e com as duas imagens já baixadas; senão (None, None)."""
     try:
@@ -539,11 +603,23 @@ def arrastar_slider(pagina, frame, g, alvo_x):
 
 
 class Pje:
-    """Chrome instalado, com perfil próprio, controlado por CDP. Resolve o captcha Tencent sozinho."""
+    """Chrome instalado, com perfil próprio, controlado por CDP. Resolve o captcha Tencent sozinho.
+    O captcha é por pesquisa (o servidor recusa o ticket repetido), mas o link do detalhe (?ca=) que a pesquisa dá
+    abre sem captcha e por HTTP puro. Por isso: a pesquisa pelo nome da parte (1 captcha) traz até 30 processos da
+    pessoa com o link de cada um; esses e os achados pelo número ficam em `links` e abrem por HTTP (detalhe_http)."""
 
     def __init__(self):
         self.proc = self.pw = self.pagina = None
         self.imagens = {}                               # url -> resposta das imagens do captcha
+        self.links = {}                                 # cnj20 -> link do detalhe (?ca=), do mais velho ao novo
+        self.http = requests.Session()
+        self.http.headers["User-Agent"] = UA
+
+    def guardar_link(self, numero20, link):
+        self.links.pop(numero20, None)
+        self.links[numero20] = H.unescape(link)
+        if len(self.links) > MAX_LINKS_GUARDADOS:
+            self.links.pop(next(iter(self.links)))
 
     def abrir(self):
         """Abre o Chrome no perfil do worker, conecta por CDP e passa a guardar as imagens do captcha.
@@ -634,10 +710,19 @@ class Pje:
         raise PjeInstavel(f"PESQUISA_SEM_RESPOSTA: o PJe não respondeu em {ESPERA_PJE} s")
 
     def consultar(self, numero20, tentativas=2):
-        """{resultado: OK|NAO_ENCONTRADO, capa, partes, advogados, completa} do processo pelo número. O PJe instável
-        trava pesquisas ao acaso (o mesmo processo abre na vez seguinte): sem resposta, recarrega e pesquisa de novo,
-        até `tentativas` vezes. A tela de indisponível não é repetida (o PJe está fora). Pesquisa sem resultado
-        (processo inexistente ou em segredo de justiça) também é repetida uma vez, para confirmar."""
+        """{resultado: OK|NAO_ENCONTRADO|SEM_DETALHE, capa, partes, advogados, completa, linha, via: HTTP|PJE} do
+        processo pelo número (SEM_DETALHE: está na pesquisa, mas sem link para o detalhe; vem só a `linha`).
+        Com o link do detalhe já conhecido, abre por HTTP sem captcha (via HTTP); link que não abre mais sai da
+        memória e o processo é pesquisado. O PJe instável trava pesquisas ao acaso (o mesmo processo abre na vez
+        seguinte): sem resposta, recarrega e pesquisa de novo, até `tentativas` vezes. A tela de indisponível não é
+        repetida (o PJe está fora). Pesquisa sem resultado (processo inexistente ou em segredo de justiça) também é
+        repetida uma vez, para confirmar."""
+        if numero20 in self.links:
+            dados = self.detalhe_http(numero20, self.links[numero20])
+            if dados:
+                return dados
+            log.info(f"{formatar_cnj(numero20)}: o link do detalhe não abriu por HTTP; pesquisando pelo número")
+            self.links.pop(numero20, None)
         for vez in range(1, tentativas + 1):
             try:
                 dados = self.pesquisar(numero20)
@@ -658,20 +743,27 @@ class Pje:
             return dados
 
     @staticmethod
-    def veio_vazia(respostas, lidas):
-        """A resposta AJAX da pesquisa trouxe a tabela de processos vazia ('processosGridCount':null e nenhum link de
-        detalhe): o PJe não achou o processo (não existe ou está em segredo de justiça). Hoje o TJBA não escreve
-        'não encontrou nenhum processo'; e a página inicial já vem com a tabela vazia, por isso vale só a resposta
-        da pesquisa. `lidas` guarda o corpo de cada resposta (lido uma vez só)."""
+    def sem_detalhe(respostas, lidas):
+        """A resposta AJAX da pesquisa veio sem link de detalhe: 'NADA' se a tabela de processos veio vazia
+        ('processosGridCount':null: o PJe não achou o processo, não existe ou está em segredo de justiça);
+        {"linha": texto} se o processo veio na tabela mas sem o "Ver detalhes" (detalhe fechado ao público: a
+        linha só mostra classe, número e '1ª parte do polo ativo X 1ª do passivo'). Hoje o TJBA não escreve 'não
+        encontrou nenhum processo'; e a página inicial já vem com a tabela vazia, por isso vale só a resposta da
+        pesquisa. `lidas` guarda o corpo de cada resposta (lido uma vez só). None enquanto não chegou."""
         for r in respostas:
             if r not in lidas:
                 try:
                     lidas[r] = r.text()
                 except ErroNavegador:                   # corpo ainda não disponível: tenta na próxima volta
                     continue
-            if RE_GRID_VAZIO.search(lidas[r]) and not RE_LINK_DETALHE.search(lidas[r]):
-                return True
-        return False
+            txt = lidas[r]
+            if RE_LINK_DETALHE.search(txt):
+                continue
+            if RE_GRID_VAZIO.search(txt):
+                return "NADA"
+            if RE_GRID_COM_LINHAS.search(txt) and (linhas := RE_LINHA.findall(txt)):
+                return {"linha": linha_da_tabela(linhas[0])}
+        return None
 
     def pesquisar(self, numero20):
         """Uma pesquisa, da tela de pesquisa ao detalhe lido (ver consultar)."""
@@ -693,10 +785,13 @@ class Pje:
                 campo.fill(formatar_cnj(numero20))
             pg.on("response", guardar)
             pg.locator(BOTAO_PESQUISAR).click()
-            achou = self.esperar(pg, lambda h: RE_LINK_DETALHE.search(h) or (
-                "NADA" if RE_NADA.search(h) or self.veio_vazia(respostas, lidas) else None))
+            achou = self.esperar(pg, lambda h: RE_LINK_DETALHE.search(h) or self.sem_detalhe(respostas, lidas) or (
+                "NADA" if RE_NADA.search(h) else None))
             if achou == "NADA":
-                return {"resultado": "NAO_ENCONTRADO"}
+                return {"resultado": "NAO_ENCONTRADO", "via": "PJE"}
+            if isinstance(achou, dict):                 # o processo existe, mas o detalhe não é público
+                return {"resultado": "SEM_DETALHE", "linha": achou["linha"], "via": "PJE"}
+            self.guardar_link(numero20, achou.group(1))
             det = pg.context.new_page()
             try:
                 self.conferir_no_ar(det.goto(urljoin(BASE, achou.group(1)), wait_until="domcontentloaded",
@@ -733,10 +828,114 @@ class Pje:
                 celula.first.click()
                 time.sleep(1.5)
                 partes += partes_da_pagina(det.content())
-        unicas = list({(p["nome"], p["documento"], p["papel"], p["polo"]): p for p in partes}.values())
-        return {"resultado": "OK", "capa": campos_da_capa(html), "completa": completa,
-                "partes": [p for p in unicas if not RE_ADVOGADO.search(p["papel"])],
-                "advogados": [p for p in unicas if RE_ADVOGADO.search(p["papel"])]}
+        return dados_do_detalhe(html, partes, completa, "PJE")
+
+    def conferir_http(self, resposta):
+        """PjeInstavel se a resposta por HTTP é um erro do TJBA (5xx ou a tela de indisponível)."""
+        if resposta.status_code >= 500 or RE_PJE_FORA.search(resposta.text):
+            raise PjeInstavel(f"PJE_INDISPONIVEL: HTTP {resposta.status_code} no detalhe por HTTP")
+
+    def detalhe_http(self, numero20, link):
+        """O detalhe pelo link ?ca= por HTTP, sem navegador e sem captcha, virando as páginas das tabelas de partes
+        com o POST AJAX do paginador (o mesmo que o clique faz). None se o link não abre o processo (vencido) ou a
+        página veio sem as tabelas de partes: aí o processo é pesquisado pelo número."""
+        try:
+            r = self.http.get(urljoin(BASE, link), timeout=60)
+            self.conferir_http(r)
+            html = r.text
+            if r.status_code != 200 or formatar_cnj(numero20) not in html or "processoPartesPoloAtivo" not in html:
+                return None
+            partes, completa = partes_da_pagina(html), True
+            for scroller, form, acao in RE_SCROLLER.findall(html):
+                ultima, pagina, atual = paginas_do_scroller(html, scroller), 2, html
+                while pagina <= min(ultima, MAX_PAGINAS_PARTES):
+                    vs = RE_VIEWSTATE.search(atual) or RE_VIEWSTATE.search(html)
+                    resp = self.http.post(urljoin(BASE, H.unescape(acao)), timeout=60, data={
+                        "AJAXREQUEST": "_viewRoot", form: form, "javax.faces.ViewState": vs.group(1) if vs else "",
+                        "ajaxSingle": scroller, scroller: str(pagina), "AJAX:EVENTS_COUNT": "1"})
+                    self.conferir_http(resp)
+                    novas = partes_da_pagina(resp.text)
+                    if resp.status_code != 200 or not novas:
+                        completa = False
+                        break
+                    partes += novas
+                    atual, pagina = resp.text, pagina + 1
+                    ultima = max(ultima, paginas_do_scroller(atual, scroller))
+                completa &= ultima <= MAX_PAGINAS_PARTES
+        except requests.RequestException as e:
+            log.info(f"{formatar_cnj(numero20)}: detalhe por HTTP falhou ({type(e).__name__})")
+            return None
+        return dados_do_detalhe(html, partes, completa, "HTTP")
+
+    def resposta_da_pesquisa(self, respostas, lidas):
+        """Corpo da resposta AJAX da pesquisa com a tabela de resultados; 'NADA' se veio vazia; 'CAPTCHA_ERRADO' se o
+        servidor recusou o captcha; None enquanto não chegou."""
+        for r in respostas:
+            if r not in lidas:
+                try:
+                    lidas[r] = r.text()
+                except ErroNavegador:
+                    continue
+            txt = lidas[r]
+            if RE_CAPTCHA_ERRADO.search(H.unescape(txt)):
+                return "CAPTCHA_ERRADO"
+            if RE_LINK_DETALHE.search(txt):
+                return txt
+            if RE_GRID_VAZIO.search(txt):
+                return "NADA"
+        return None
+
+    def pesquisar_nome(self, nome):
+        """Pesquisa pelo nome da parte (1 captcha): [{cnj, texto}] da 1ª página de resultados (até 30 processos;
+        a 2ª página pede outro captcha), com o link de cada um guardado em `links`. `texto` é a linha da tabela
+        (classe, número, assunto, 'polo ativo X polo passivo', normalizada). None se a pesquisa não voltou: o
+        crédito segue pela pesquisa por número. Pesquisa que não voltou ou captcha recusado: PjeInstavel (quem chama
+        decide se segue pelo número ou adia o crédito)."""
+        self.imagens.clear()
+        pg = self.pagina
+        respostas, lidas = [], {}
+
+        def guardar(resposta):
+            if resposta.request.method == "POST" and "/ConsultaPublica/listView.seam" in resposta.url:
+                respostas.append(resposta)
+        try:
+            self.conferir_no_ar(pg.goto(URL, wait_until="domcontentloaded", timeout=60000), pg.content())
+            campo = pg.locator(CAMPO_NOME)
+            campo.wait_for(timeout=30000)
+            campo.fill(nome)
+            pg.on("response", guardar)
+            pg.locator(BOTAO_PESQUISAR).click()
+            txt = self.esperar(pg, lambda h: self.resposta_da_pesquisa(respostas, lidas))
+        except PjeInstavel:
+            try:                                        # a resposta atrasada ainda navegaria a página
+                pg.goto("about:blank", timeout=15000)
+            except ErroNavegador:
+                pass
+            raise
+        except ErroNavegador as e:
+            motivo = f"PROCESSO_NAO_CARREGOU: {str(e).splitlines()[0][:150]}"
+            if re.search(r"closed|Target|browser", motivo, re.I):
+                raise ErroTecnico(motivo) from e
+            raise PjeInstavel(motivo) from e
+        finally:
+            try:
+                pg.remove_listener("response", guardar)
+            except Exception:
+                pass
+        if txt == "CAPTCHA_ERRADO":
+            raise PjeInstavel("CAPTCHA_RECUSADO: o PJe recusou o captcha da pesquisa por nome")
+        if txt == "NADA":
+            return []
+        linhas, todas = [], RE_LINHA.findall(txt)       # linha sem link (detalhe fechado) fica de fora
+        for linha in todas:
+            link, cnj = RE_LINK_DETALHE.search(linha), CNJ.search(linha)
+            if link and cnj:
+                self.guardar_link(so_digitos(cnj.group(0)), link.group(1))
+                linhas.append({"cnj": so_digitos(cnj.group(0)), "texto": linha_da_tabela(linha)})
+        total = RE_TOTAL.search(H.unescape(txt))
+        if total and int(total.group(1)) > len(todas):
+            log.info(f"pesquisa pelo nome {nome!r}: {total.group(1)} processos, só os {len(todas)} da 1ª página")
+        return linhas
 
 # =============================================================================== banco: leitura
 
@@ -819,6 +1018,15 @@ def confirmar(partes, alvo, chaves):
 # =============================================================================== decisão (só lê: banco, DJEN, PJe)
 
 
+def credor_dos_outros(cands, outros):
+    """Credor dos processos achados pelo nome quando o originário não abre: todos com o mesmo CPF/CNPJ válido.
+    Senão None."""
+    documentos = {cands[n]["credor"]["documento"] for n in outros}
+    if not outros or len(documentos) != 1 or None in documentos:
+        return None
+    return dict(cands[outros[0]]["credor"])
+
+
 def credor_unico(cands, confirmados):
     """Credor de vários originários confirmados sem desempate, quando todos são a mesma pessoa: o mesmo CPF/CNPJ
     válido em cada um e nenhum candidato ficou sem conferir (não aberto, não achado no PJe ou pulado), porque um
@@ -833,7 +1041,8 @@ def credor_unico(cands, confirmados):
 def processar(cur, lead, djen, pje, inicio):
     """Acha e confirma o originário. Devolve o resultado a gravar."""
     r = {"status": "FALHA", "motivo": "", "via": "NOME", "originario": None, "regra": "", "fontes": "",
-         "credor": None, "capas": [], "candidatos": [], "capa_escolhida": None, "partes_escolhido": []}
+         "credor": None, "capas": [], "candidatos": [], "capa_escolhida": None, "partes_escolhido": [],
+         "acessos": {"nome": 0, "numero": 0, "http": 0}}
     nomes = []
     for b in lead["beneficiarios"]:
         nomes += [n for n in nomes_para_buscar(b) if chave_nome(n) not in {chave_nome(x) for x in nomes}]
@@ -879,9 +1088,6 @@ def processar(cur, lead, djen, pje, inicio):
     for n, info in do_djen:
         somar(n, "DJEN", info)
     nota_adv = " (o beneficiário aparece como advogado no DJEN: honorários?)" if como_advogado else ""
-    if not cands:
-        r["motivo"] = "PROCESSO_NAO_ENCONTRADO: nenhum candidato no DJEN nem pista do RPA" + nota_adv
-        return r
 
     # ordem de conferência: evidência forte, o já ligado, a pista do RPA, depois a ordem do DJEN
     ordem = sorted(cands, key=lambda n: (not cands[n]["forte"], "LIGADO" not in cands[n]["fontes"],
@@ -893,39 +1099,101 @@ def processar(cur, lead, djen, pje, inicio):
         decisivo, regra_decisivo = ordem[0], regra_forte(ordem[0]) if com_forte else "UNICO"
     elif len(com_forte) == 1:
         decisivo, regra_decisivo = com_forte[0], regra_forte(com_forte[0])
-    else:
+    elif cands:
         oab_prec = oabs_do_precatorio(djen, prec20)
         com_oab = [n for n in (com_forte or ordem) if cands[n]["oabs"] & oab_prec]
         if len(com_oab) == 1:
             decisivo, regra_decisivo = com_oab[0], "OAB"
 
-    abertos = 0
-    for n in ordem:
-        if time.time() - inicio > TETO_CREDITO:
-            raise ErroTecnico(f"TIMEOUT_PAGINA_PROCESSO: passou de {TETO_CREDITO // 60} min no crédito")
-        c = cands[n]
-        existentes = partes_do_banco(cur, n)
-        partes_bd = [{"nome": e["nome"], "documento": e["documento"] or "", "polo": e["polo"]}
-                     for e in existentes if e["papel"] != "ADVOGADO"]
-        credor, ente_ok = confirmar(partes_bd, alvo, chaves)
-        if credor and ente_ok and documento_valido(credor["documento"]):
-            c.update(confirmado=True, capa="BANCO", partes=partes_bd,
-                     credor={"nome": credor["nome"], "documento": so_digitos(credor["documento"])})
-        elif abertos < MAX_ABERTOS_PJE:
-            abertos += 1
-            dados = pje.consultar(n)
-            time.sleep(PAUSA_PJE)
-            c["pje"] = dados["resultado"]
-            if dados["resultado"] == "OK":
-                credor, ente_ok = confirmar(dados["partes"], alvo, chaves)
-                if credor and ente_ok:
-                    doc = so_digitos(credor["documento"])
-                    c.update(confirmado=True, capa="PJE", dados=dados, partes=dados["partes"],
-                             credor={"nome": credor["nome"], "documento": doc if documento_valido(doc) else None})
+    # PJe: 1 pesquisa pelo nome (1 captcha) dá o link de até 30 processos da pessoa, que abrem por HTTP sem captcha;
+    # o candidato que não veio nela é pesquisado pelo número (1 captcha cada, até MAX_ABERTOS_PJE)
+    acessos = r["acessos"] = {"nome": 0, "numero": 0, "http": 0}
+    a_pesquisar = nomes[:MAX_NOMES_PJE]
+    do_nome = {}                                        # cnj20 -> linha da tabela da pesquisa por nome
+
+    def pesquisar_nomes(quantos, obrigatoria):
+        """Pesquisa os próximos nomes. Falha (PJe instável): na busca de atalho segue pelo número; na obrigatória
+        (a pesquisa por nome é a última fonte de candidatos) o crédito é adiado, não vira FALHA."""
+        for nome in a_pesquisar[:quantos]:
+            a_pesquisar.remove(nome)
+            acessos["nome"] += 1
+            try:
+                linhas = pje.pesquisar_nome(nome)
+            except PjeInstavel as e:
+                if obrigatoria or str(e).startswith("PJE_INDISPONIVEL"):
+                    raise
+                log.info(f"{lead['credito_id']}: pesquisa pelo nome {nome!r}: {e}; segue pelo número")
+                continue
+            finally:
+                time.sleep(PAUSA_PJE)
+            for linha in linhas:
+                do_nome.setdefault(linha["cnj"], linha["texto"])
+
+    def conferir(numeros, parar_em=None):
+        """Confirma cada candidato pela capa do banco ou pelo PJe (detalhe por HTTP ou pesquisa pelo número)."""
+        for n in numeros:
+            if time.time() - inicio > TETO_CREDITO:
+                raise ErroTecnico(f"TIMEOUT_PAGINA_PROCESSO: passou de {TETO_CREDITO // 60} min no crédito")
+            c = cands[n]
+            existentes = partes_do_banco(cur, n)
+            partes_bd = [{"nome": e["nome"], "documento": e["documento"] or "", "polo": e["polo"]}
+                         for e in existentes if e["papel"] != "ADVOGADO"]
+            credor, ente_ok = confirmar(partes_bd, alvo, chaves)
+            if credor and ente_ok and documento_valido(credor["documento"]):
+                c.update(confirmado=True, capa="BANCO", partes=partes_bd,
+                         credor={"nome": credor["nome"], "documento": so_digitos(credor["documento"])})
+                continue
+            if n not in pje.links:
+                pesquisar_nomes(1, obrigatoria=False)
+            if (n in pje.links and acessos["http"] < MAX_DETALHES_HTTP) or acessos["numero"] < MAX_ABERTOS_PJE:
+                dados = pje.consultar(n)
+                if dados["via"] == "HTTP":
+                    acessos["http"] += 1
+                else:
+                    acessos["numero"] += 1
+                    time.sleep(PAUSA_PJE)
+                c["pje"] = dados["resultado"]
+                if dados["resultado"] == "SEM_DETALHE":
+                    c.update(linha=dados["linha"], linha_confere=linha_confere(dados["linha"], alvo, chaves))
+                if dados["resultado"] == "OK":
+                    credor, ente_ok = confirmar(dados["partes"], alvo, chaves)
+                    if credor and ente_ok:
+                        doc = so_digitos(credor["documento"])
+                        c.update(confirmado=True, capa="PJE", dados=dados, partes=dados["partes"],
+                                 credor={"nome": credor["nome"],
+                                         "documento": doc if documento_valido(doc) else None})
+            else:
+                c["pje"] = "NAO_ABERTO"
+            if c.get("confirmado") and n == parar_em:   # o desempate já aponta este: não precisa abrir os outros
+                break
+
+    conferir(ordem, decisivo)
+    # o candidato claro (desempate prévio) que o PJe não deixa ler: não achado na pesquisa (segredo) ou achado sem
+    # o link do detalhe (só a linha). Ele é o originário (PROC_SEM_CAPA); com a linha mostrando beneficiário X ente,
+    # vale mesmo vindo só da pista do RPA
+    claro = None
+    if decisivo and cands[decisivo].get("pje") in ("NAO_ENCONTRADO", "SEM_DETALHE") and (
+            "DJEN" in cands[decisivo]["fontes"] or cands[decisivo]["forte"] or cands[decisivo].get("linha_confere")):
+        claro = decisivo
+    outros = []                                         # processos achados pelo nome que dão o CPF do credor
+    if not any(c.get("confirmado") for c in cands.values()):
+        # nenhum candidato do DJEN/RPA confirmado (ou nenhum candidato): os processos da pesquisa por nome com o
+        # ente no polo passivo viram candidatos (fonte PJE_NOME), conferidos pelo detalhe por HTTP. Com um
+        # originário claro que não abre, eles não disputam com ele: só servem para achar o CPF do credor
+        pesquisar_nomes(len(a_pesquisar), obrigatoria=True)
+        novos = [n for n in candidatos_do_nome(do_nome, prec20, chaves) if n not in cands]
+        for n in novos:
+            somar(n, "PJE_NOME")
+            cands[n]["classe"] = do_nome[n][:80]
+        novos = [n for n in novos if n in cands]
+        conferir(novos)
+        if claro:
+            outros = [n for n in novos if cands[n].get("confirmado")]
         else:
-            c["pje"] = "NAO_ABERTO"
-        if c.get("confirmado") and n == decisivo:       # o desempate já aponta este: não precisa abrir os outros
-            break
+            ordem += novos
+    if not cands:
+        r["motivo"] = "PROCESSO_NAO_ENCONTRADO: nenhum candidato no DJEN, no PJe (nome) nem pista do RPA" + nota_adv
+        return r
 
     conf = [n for n in ordem if cands[n].get("confirmado")]
     escolhido, regra = None, ""
@@ -943,8 +1211,9 @@ def processar(cur, lead, djen, pje, inicio):
 
     r["candidatos"] = [{"cnj": formatar_cnj(n), "fontes": cands[n]["fontes"], "valor": cands[n]["valor"],
                         "forte": cands[n]["forte"], "confirmado": bool(cands[n].get("confirmado")),
-                        "capa": cands[n].get("capa"), "pje": cands[n].get("pje"), "classe": cands[n]["classe"]}
-                       for n in ordem[:20]]
+                        "capa": cands[n].get("capa"), "pje": cands[n].get("pje"), "classe": cands[n]["classe"],
+                        **({"linha": cands[n]["linha"]} if cands[n].get("linha") else {})}
+                       for n in (ordem + outros)[:20]]
     def capas_pje(numeros):
         """(cnj, "PJE", dados) dos candidatos cuja capa veio do PJe (vão para o registrar_capa)."""
         return [(n, "PJE", cands[n]["dados"]) for n in numeros if cands[n].get("capa") == "PJE"]
@@ -970,12 +1239,21 @@ def processar(cur, lead, djen, pje, inicio):
         credor = credor_unico(cands, conf)
         if credor:                                      # o originário fica em aberto; o credor já é certo
             r.update(credor=credor, regra="CREDOR_UNICO")
-    elif decisivo and cands[decisivo].get("pje") == "NAO_ENCONTRADO" and \
-            ("DJEN" in cands[decisivo]["fontes"] or cands[decisivo]["forte"]):
-        # 1 candidato claro, mas o PJe público não abre o processo: liga sem capa
-        r.update(originario=decisivo, regra=regra_decisivo, via="ORIGINARIO",
-                 fontes=",".join(cands[decisivo]["fontes"]),
-                 motivo=f"PROC_SEM_CAPA: cnj={formatar_cnj(decisivo)} regra={regra_decisivo} (não abre no PJe público)")
+    elif claro:
+        # 1 candidato claro, mas o PJe público não deixa ler as partes: liga sem capa
+        c = cands[claro]
+        porque = (f"sem detalhe público no PJe; linha: {c['linha'][:200]}" if c["pje"] == "SEM_DETALHE"
+                  else "não abre no PJe público")
+        r.update(originario=claro, regra=regra_decisivo, via="ORIGINARIO", fontes=",".join(c["fontes"]),
+                 motivo=f"PROC_SEM_CAPA: cnj={formatar_cnj(claro)} regra={regra_decisivo} ({porque})")
+        credor = credor_dos_outros(cands, outros)
+        if credor:
+            # o CPF vem de outros processos públicos da mesma pessoa contra o mesmo ente (todos com o mesmo CPF):
+            # liga o credor sem processo e deixa para conferência
+            r.update(status="SUCESSO_ANALISAR", credor=credor, credor_sem_processo=True,
+                     regra="CREDOR_OUTRO_PROCESSO", capas=capas_pje(outros),
+                     motivo=f"PROC_SEM_CAPA_CREDOR_OUTRO_PROCESSO: cnj={formatar_cnj(claro)} regra={regra_decisivo} "
+                            f"({porque}); CPF em " + ",".join(formatar_cnj(n) for n in outros))
     else:
         r["motivo"] = f"PROCESSO_NAO_ENCONTRADO: {len(cands)} candidato(s), nenhum confirmado" + nota_adv
     return r
@@ -1057,13 +1335,19 @@ def filas_antigas(cur):
     return banco.filas_antigas(cur, FILA_ANTIGA_DESDE)[0]
 
 
+def sem_polo(papel_bruto):
+    """papel_bruto do banco sem o polo na frente: o registrar_capa grava 'POLO / papel' e põe o polo de novo a cada
+    regravação ('ATIVO / ATIVO / ... / REQUERENTE'), por isso a capa do banco é reenviada sem ele."""
+    return re.sub(r"^(?:(?:ATIVO|PASSIVO)\s*/\s*)+", "", papel_bruto or "") or None
+
+
 def partes_para_banco(cur, dados, existentes, fonte):
     """(partes, advogados) para registrar_capa. Capa do banco: reenvia como está (só para o recálculo ligar o
     credor). PJe inteiro: vale o PJe, com o CPF que faltar vindo do banco (mesmo nome). PJe cortado: só acrescenta."""
     do_banco = ([{"nome": e["nome"], "cpf_cnpj": e["documento"], "polo": e["polo"], "papel": e["papel"],
-                  "papel_bruto": e["papel_bruto"]} for e in existentes if e["papel"] != "ADVOGADO"],
+                  "papel_bruto": sem_polo(e["papel_bruto"])} for e in existentes if e["papel"] != "ADVOGADO"],
                 [{"nome": e["nome"], "cpf_cnpj": e["documento"], "polo": e["polo"], "oab_uf": e["oab_uf"],
-                  "oab_numero": e["oab_numero"], "papel_bruto": e["papel_bruto"]}
+                  "oab_numero": e["oab_numero"], "papel_bruto": sem_polo(e["papel_bruto"])}
                  for e in existentes if e["papel"] == "ADVOGADO"])
     if fonte == "BANCO":
         return do_banco
@@ -1261,7 +1545,8 @@ def gravar(cur, lead, r, filas, status_legado, bk):
         if cur.fetchone()[0]:
             cur.execute("""SELECT creditos.registrar_credor(p_credito_id => %s, p_papel => 'CREDOR', p_nome => %s,
                                                             p_documento => %s, p_processo_id => %s, p_fonte => %s)""",
-                        (cid, r["credor"]["nome"], r["credor"]["documento"], proc_escolhido, SOFTWARE))
+                        (cid, r["credor"]["nome"], r["credor"]["documento"],
+                         None if r.get("credor_sem_processo") else proc_escolhido, SOFTWARE))
     for cnj, fonte, dados in r["capas"]:
         travar_processo(cur, cnj)
         partes, advogados = partes_para_banco(cur, dados, partes_do_banco(cur, cnj), fonte)
@@ -1283,7 +1568,8 @@ def gravar(cur, lead, r, filas, status_legado, bk):
                "capa": r["capa_escolhida"],
                "partes": [{k: p.get(k) for k in ("nome", "polo", "papel", "documento")}
                           for p in r["partes_escolhido"]][:60],
-               "credores_antes": fmt_credores(antes), "credores_depois": fmt_credores(depois)}
+               "credores_antes": fmt_credores(antes), "credores_depois": fmt_credores(depois),
+               "acessos_pje": r["acessos"]}
     cur.execute("""SELECT creditos.fila_credor_finalizar(p_credito_id => %s, p_worker => %s, p_status => %s,
                                                          p_motivo => %s, p_via => %s, p_sistema => 'PJE',
                                                          p_processo_cnj => %s, p_detalhe => %s::jsonb, p_host => %s)""",
@@ -1371,6 +1657,7 @@ def registrar_credito(rod, item, gravou):
     credito_fonte.metadata). Credor que saiu do crédito vai para o log como aviso.
     MAX_FALHAS_SEGUIDAS gravações seguidas em FALHA param o robô (banco com problema)."""
     lead, r, g = item["lead"], item["r"], item["gravado"]
+    a = r["acessos"]
     rod.resultados[r["status"]] += 1
     rod.falhas_gravacao = 0 if gravou else rod.falhas_gravacao + (r["status"] == "FALHA")
     gravacao = ("ROLLBACK, simulação" if rod.simulacao else "COMMIT") if gravou else "não gravado"
@@ -1378,7 +1665,8 @@ def registrar_credito(rod, item, gravou):
     log.log(logging.INFO if gravou else logging.WARNING,
             f"[{rod.n}] {lead['credito_id']} {lead['precatorio']} -> {r['status']}{motivo} "
             f"{formatar_cnj(r['originario']) if r['originario'] else ''} "
-            f"{('CPF ' + r['credor']['documento']) if r['credor'] else ''} | {item['segundos']} s | {gravacao}")
+            f"{('CPF ' + r['credor']['documento']) if r['credor'] else ''} | {item['segundos']} s | "
+            f"PJe {a['nome']} nome/{a['numero']} nº/{a['http']} http | {gravacao}")
     if saiu := g["antes"] - g["depois"]:
         log.warning(f"{lead['credito_id']}: credor saiu do crédito: {fmt_credores(saiu)} "
                     f"(ficou: {fmt_credores(g['depois']) or 'nenhum'})")
@@ -1544,6 +1832,7 @@ def pje_voltou(rod):
     """A sonda abre duas vezes seguidas, sem a nova tentativa do consultar (um acerto só no PJe instável engana)."""
     for _ in range(2):
         try:
+            rod.pje.links.pop(SONDA_PJE, None)          # a sonda testa a pesquisa, não o link guardado
             rod.pje.consultar(SONDA_PJE, tentativas=1)
         except ErroTecnico as e:
             log.info(f"sonda do PJe falhou: {e}")

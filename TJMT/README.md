@@ -117,6 +117,12 @@ advogados)" no motivo.
   advogados do credor que também estão no precatório, com CPF; só acrescenta ao que o banco já tem. Gravar todos os
   autores faria o recálculo do banco ligar cada um ao precatório como credor; em processo coletivo (2+ autores ou
   2+ créditos ligados) vai sem advogados, que o recálculo espalharia para todos os créditos.
+- **Ação coletiva que já está no banco:** se o originário já tem no banco outros credores (autores vindos de
+  raspagens antigas) e nenhum outro crédito ligado, o robô liga só o credor e **não** liga o originário nem grava a
+  capa (motivo começa com `ORIGINARIO_COLETIVO_NAO_LIGADO`). Ligar faria o `registrar_capa` → `recalcular_credores_do_processo`
+  ligar todos os autores como credores deste crédito (aconteceu em 5 créditos na carga de 01–02/10/2026: 42 vínculos,
+  desfeitos com `TJMT/corrigir_coletivos.py`, que também tira o precatório de `precatorio_relacionado` na capa antiga,
+  senão a sincronização do legado religa o originário).
 - **`creditos.processo.metadata`:** `capa_pje` no formato dos outros robôs (`fonte: consulta_tjmt`, `campos`:
   comarca, órgão, classe, data da distribuição, valor da causa, arquivado; `partes`) e `dataAjuizamento` (a data mais
   antiga do número: processo migrado para o PJe traz a da migração). Só acrescenta; backup do anterior.

@@ -5,8 +5,8 @@ créditos (LOTE_GRAVACAO_TJRJ no .env). No lugar do modo credor do RPA_SISTEMAS 
 
 O originário já vem da lista do TJRJ (lista_item.metadata.NumeroProcOriginario, ligado em credito_originario), então:
 1. Fila: ordem própria (T1 não pagos na fila cronológica -> T2 outros não pagos -> T3 pagos; maior valor primeiro).
-   Só entram leads com originário CNJ do TJRJ (com ou sem máscara) e com o número normalizado de 10 dígitos; sem
-   originário (ou de outro tribunal) fica para o RPA. Cada crédito é reservado com lease (reservar) e só nessa hora
+   Entra todo lead com originário CNJ do TJRJ (com ou sem máscara), inclusive os que saíram da lista e os de número
+   malformado na carga legada (usa o número da lista); sem originário (ou de outro tribunal) fica para o RPA. Cada crédito é reservado com lease (reservar) e só nessa hora
    passa do RPA para o software próprio (CONSULTA_PUBLICA_TJRJ); o que o RPA tinha fica em desfazer_fila_*.sql.
 2. Originário '08...' (ou só no PJe): consulta pública do PJe 1º grau (reCAPTCHA desligado, 'if (false)'), que traz o
    polo ativo com CPF completo.
@@ -132,13 +132,14 @@ TOLERANCIA_VALOR = 1.00                # R$ de diferença entre o valor bruto da
 RAZAO_PRINCIPAL = 0.50                 # a partir daqui é o principal (ou complementar/parcela): credor = autor
 RAZAO_HONORARIOS = 0.35                # até aqui, possível honorários; entre as duas, zona de dúvida (analisar)
 
-# eJUD 2º grau no Chrome instalado (medido em 01/10/2026: 40 de 40 páginas, 1,7 s cada, score do reCAPTCHA 0,9)
+# eJUD 2º grau no Chrome instalado (medido em 01/10/2026: 40 de 40 páginas, 1,7 s cada, score do reCAPTCHA 0,9).
+# Na rodada real, 2 Chromes a 1 página/s cada levaram o score a 0,1 depois de ~45 min: ritmo conservador.
 EJUD_PROCESSO = EJUD + "ConsultaProcesso.aspx?N={}"
-CHROMES = 2                            # Chromes abertos para o eJUD 2º grau (--chromes; 0 = 2º grau fica para o RPA)
+CHROMES = 1                            # Chromes abertos para o eJUD 2º grau (--chromes; 0 = 2º grau fica para o RPA)
 TIMEOUT_EJUD = 45                      # s esperando a página trazer os dados do processo
-INTERVALO_EJUD = 1.0                   # s entre duas páginas no mesmo Chrome
+INTERVALO_EJUD = 5.0                   # s entre duas páginas no mesmo Chrome
 SCORE_MINIMO_EJUD = 0.3                # a própria página recusa abaixo disso ("Interação não humana detectada")
-PAUSA_EJUD = 5 * 60                    # s que um Chrome descansa depois de o reCAPTCHA recusar
+PAUSA_EJUD = 30 * 60                   # s que um Chrome descansa depois de o reCAPTCHA recusar
 ERROS_PARA_REABRIR = 3                 # erros seguidos num Chrome que o fazem fechar e abrir de novo
 HOST = "http://127.0.0.1"              # depuração remota (CDP) dos Chromes
 
@@ -645,6 +646,12 @@ class Ejud:
                         raise ErroTecnico("INTERROMPIDO" if self.parar.is_set() else
                                           "TIMEOUT_EJUD: o eJUD 2º grau não devolveu o processo a tempo") from None
 
+    def pausa_restante(self):
+        """Segundos até um Chrome voltar quando TODOS estão em pausa; 0 se algum está livre ou se nenhum abriu."""
+        if not self.threads:
+            return 0.0
+        return max(0.0, min(self.pausa_ate) - time.monotonic())
+
     def fechar(self):
         """Para os Chromes (cada thread fecha o seu) e espera as threads."""
         for _ in self.threads:
@@ -702,6 +709,13 @@ class Ejud:
 
             def guardar(resp):
                 if resp.request.method == "POST" and ("DadosProcesso" in resp.url or "RecaptchaVerify" in resp.url):
+                    # resposta atrasada de uma página abandonada (recusa, tempo esgotado) não vale para a página atual
+                    alvo = caixa.get("alvo") or ""
+                    if "DadosProcesso" in resp.url and alvo not in (resp.request.post_data or ""):
+                        return
+                    origem = resp.request.headers.get("referer") or ""
+                    if "RecaptchaVerify" in resp.url and origem and f"N={alvo}" not in origem:
+                        return
                     try:
                         corpo = resp.body().decode("utf-8", "replace")
                     except Exception:
@@ -747,6 +761,7 @@ class Ejud:
     def _pagina(self, i, pagina, caixa, numero):
         """Abre a página do processo e espera o JSON que ela mesma busca. dict, ou None se o eJUD não devolve dados."""
         caixa.clear()
+        caixa["alvo"] = numero
         inicio, conferido = time.time(), False
         try:
             pagina.goto(EJUD_PROCESSO.format(numero), wait_until="commit", timeout=TIMEOUT_EJUD * 1000)
@@ -797,8 +812,10 @@ def consultar_ejud(http, ejud, cnj20, prazo):
     if not p2:
         return out
     d = ejud.consultar(p2["numProcesso"], prazo)
-    if not d or so_digitos(d.get("CodCNJ")) != cnj20:
+    if not d:
         return out
+    if so_digitos(d.get("CodCNJ")) != cnj20:            # dados de outro processo: nunca vira FALHA, tenta depois
+        raise ErroTecnico("PESQUISA_SEM_RESPOSTA: o eJUD 2º grau devolveu os dados de outro processo")
     partes, advogados, polo_atual = [], [], None
     for x in d.get("Personagens") or d.get("Partes") or []:
         nome = " ".join((x.get("Nome") or "").split())
@@ -1006,8 +1023,9 @@ FILTRO_PEGAVEL = f"""cc.disponivel_em <= now() AND (
        (cc.software_id = {SOFTWARE_RPA} AND cc.status_id = 1)
     OR (cc.software_id = (SELECT id FROM creditos.software WHERE codigo = '{SOFTWARE}') AND cc.status_id = 1))"""
 
-# escopo: originário CNJ do TJRJ na lista (com ou sem máscara; o 2º grau só com o eJUD ligado) e número normalizado
-# de 10 dígitos. Sem originário ou de outro tribunal fica para o RPA.
+# escopo: todo lead com originário CNJ do TJRJ na lista (com ou sem máscara; o 2º grau só com o eJUD ligado),
+# inclusive os que saíram da lista e os de número malformado na carga legada (o número da lista é usado no lugar e
+# a conferência do registrar_metadata impede criar outro crédito). Sem originário ou de outro tribunal fica para o RPA.
 SQL_ESCOPO = r"""
 SELECT cc.credito_id, cc.valor_referencia, li.valor_lista,
        li.metadata->>'Pago' AS pago, li.metadata->>'SituacaoTratada' AS situacao,
@@ -1016,8 +1034,7 @@ SELECT cc.credito_id, cc.valor_referencia, li.valor_lista,
   JOIN creditos.credito c ON c.id = cc.credito_id
   JOIN LATERAL (SELECT x.valor_lista, x.metadata FROM creditos.lista_item x
                  WHERE x.credito_id = c.id ORDER BY x.removido_em NULLS FIRST, x.updated_at DESC LIMIT 1) li ON true
- WHERE cc.tribunal_id = %s AND c.saiu_da_lista_em IS NULL AND cc.status_id <> 2
-   AND c.numero_norm ~ '^\d{10}$'
+ WHERE cc.tribunal_id = %s AND cc.status_id <> 2
    AND li.metadata->>'NumeroProcOriginario' ~ '^(\d{7}-\d{2}\.\d{4}\.8\.19\.\d{4}|\d{13}819\d{4})$'
    AND ({com_2grau} OR regexp_replace(li.metadata->>'NumeroProcOriginario', '\D', '', 'g') !~ '0000$')
    AND {filtro}
@@ -1072,6 +1089,10 @@ def ler_credito(cur, credito_id):
         raise RuntimeError(f"crédito {credito_id} não existe")
     lead = linhas[0]
     lista = lead["lista"] or {}
+    if not RE_PRECATORIO.match(lead["precatorio"] or "") and RE_PRECATORIO.match(lista.get("NumeroPrecatorio") or ""):
+        # número malformado na carga legada ('2022008-79.5202.0.04.3682'): o da lista ('2022.00879-5') é o que o
+        # DCP, o eJUD e o portal conhecem; o crédito continua o mesmo (numero_norm não muda)
+        lead["precatorio"] = lista["NumeroPrecatorio"]
     orig = (lista.get("NumeroProcOriginario") or "").strip()
     lead["originario"] = so_digitos(orig) if RE_ORIGINARIO.match(orig) else ""
     lead["ente"] = lista.get("EntidadeDevedora") or lista.get("entidade_nome") or ""
@@ -1800,7 +1821,7 @@ def reservar(con, credito_id, lease, id_software):
                           SELECT cc.credito_id, cc.software_id, cc.status_id, cc.disponivel_em
                             FROM creditos.coleta_credor cc
                             JOIN creditos.credito c ON c.id = cc.credito_id
-                           WHERE cc.credito_id = %s AND cc.tribunal_id = %s AND c.saiu_da_lista_em IS NULL
+                           WHERE cc.credito_id = %s AND cc.tribunal_id = %s
                              AND cc.status_id <> 2 AND {FILTRO_PEGAVEL}
                              FOR UPDATE OF cc SKIP LOCKED)
                         UPDATE creditos.coleta_credor cc
@@ -1908,7 +1929,7 @@ class Rodada:
         self.con.commit()
         log.info(f"{self.modo} | worker {WORKER} | software {SOFTWARE} (id {self.id_software}) | lote de {LOTE} | "
                  f"{workers} workers | ritmo {ritmo:.1f} req/s (PJe {self.ritmo_pje.teto:.1f}) | "
-                 f"eJUD 2º grau: {f'{chromes} Chrome(s)' if chromes else 'desligado'} | lease {self.lease} | "
+                 f"eJUD 2º grau: {f'{chromes} Chrome(s), {INTERVALO_EJUD:.0f} s entre páginas, pausa de {PAUSA_EJUD // 60} min se o reCAPTCHA recusar' if chromes else 'desligado'} | lease {self.lease} | "
                  f"filas antigas: {', '.join(self.filas)}")
         if simulacao:
             ordem = [] if creditos else self.ordenar()
@@ -2040,7 +2061,8 @@ def tratar(rod, item, pendentes):
     rod.resultados[item["linha"]["resultado"]] += 1
     if item["tipo"] == "IGNORAR":
         return
-    rod.falhas_seguidas += 1
+    if not item["motivo"].startswith("CAPTCHA_EJUD"):   # recusa do reCAPTCHA é freio previsto, não pane: não para
+        rod.falhas_seguidas += 1
     log.warning(f"{item['credito_id']} -> ADIADO: {item['motivo']}")
     if rod.falhas_seguidas >= MAX_FALHAS_SEGUIDAS:
         log.error(f"{MAX_FALHAS_SEGUIDAS} falhas técnicas seguidas: robô parado (DCP/PJe/eJUD fora ou bloqueando).")
@@ -2104,10 +2126,23 @@ def main():
     executor = ThreadPoolExecutor(max_workers=rod.workers, thread_name_prefix="tjrj")
     try:
         while True:
-            # 2x workers em voo: enquanto a thread principal grava um lote, os workers seguem com a fila do executor
-            while len(em_voo) < 2 * rod.workers and (credito_id := proximo_credito(rod)):
+            # 2x workers em voo: enquanto a thread principal grava um lote, os workers seguem com a fila do executor.
+            # Com todos os Chromes do eJUD em pausa (reCAPTCHA recusou), não pega mais nada: espera a pausa acabar
+            # em vez de adiar a fila inteira (e acabar com "fila vazia")
+            while not rod.ejud.pausa_restante() and len(em_voo) < 2 * rod.workers and \
+                    (credito_id := proximo_credito(rod)):
                 em_voo[executor.submit(processar_credito, rod, credito_id, rod.n)] = credito_id
             if not em_voo:
+                pausa = rod.ejud.pausa_restante()
+                if pausa and not (rod.parar.is_set() or rod.fila_vazia or (rod.limite and rod.n >= rod.limite)):
+                    if pendentes:
+                        descarregar(rod, pendentes)     # grava o que já está pronto antes de esperar
+                    log.info(f"eJUD 2º grau em pausa (o reCAPTCHA recusou): o robô espera {pausa / 60:.0f} min e "
+                             f"continua sozinho (Ctrl+C para parar)")
+                    fim = time.time() + pausa + 1
+                    while time.time() < fim and not rod.parar.is_set():
+                        time.sleep(1)                   # sleep curto: o Ctrl+C funciona durante a espera
+                    continue
                 break
             prontos, _ = wait(em_voo, return_when=FIRST_COMPLETED)
             for futuro in prontos:

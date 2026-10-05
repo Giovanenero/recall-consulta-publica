@@ -27,7 +27,7 @@ python TJRJ/fetch_TJRJ.py --limite 50                       # modo real: para de
 python TJRJ/fetch_TJRJ.py                                   # modo real: processa a fila até acabar (Ctrl+C para)
 python TJRJ/fetch_TJRJ.py --workers 6 --ritmo 6             # padrão: 6 threads, até 6 req/s ao TJRJ no total
 python TJRJ/fetch_TJRJ.py --ritmo 12                        # mais rápido (12 req/s rodou 2 h sem freada em 01/10)
-python TJRJ/fetch_TJRJ.py --chromes 3                       # Chromes para o eJUD 2º grau (padrão 2)
+python TJRJ/fetch_TJRJ.py --chromes 2                       # Chromes para o eJUD 2º grau (padrão 1; mais Chromes = mais recusa do reCAPTCHA)
 python TJRJ/fetch_TJRJ.py --chromes 0                       # sem o eJUD: os leads do 2º grau ficam para o RPA
 ```
 
@@ -64,9 +64,13 @@ Enquanto a thread principal grava um lote, os workers seguem com a fila (até 2�
 - **Fica intocado para o RPA:**
   - leads **sem originário** na lista: ~18,4 mil, quase todos pagos antigos. Nenhuma fonte pública dá o originário
     deles: a página do precatório no eJUD diz só o ente e "Informações sigilosas";
-  - originário de outro tribunal (13 leads);
-  - os 195 créditos com número normalizado fora do padrão de 10 dígitos;
-  - os que saíram da lista.
+  - originário de outro tribunal (16 leads): as fontes do robô são do TJRJ.
+- **Entram também** (desde 02/10/2026):
+  - os que saíram da lista e têm originário (33);
+  - os 195 de número malformado na carga legada (ex.: `2022008-79.5202.0.04.3682`). Todos têm originário válido. O
+    robô usa o número da lista (`NumeroPrecatorio`, ex.: `2022.00879-5`) para o DCP, o eJUD e o portal, e o crédito
+    continua o mesmo. Nenhum tem um "gêmeo" com o número certo no banco, e a conferência antes do
+    `registrar_credito` impede criar outro crédito.
 - **Reserva:** um lead por vez, com lease (`reservar`). Nessa hora ele sai do software 2 e passa para
   `CONSULTA_PUBLICA_TJRJ`, então o RPA (`fila_credor_pegar`) e o espelho do legado (`espelhar_status_credor_legado`)
   não o tocam mais. `saida/desfazer_fila_<rodada>.sql` devolve ao RPA, com o status de antes, cada lead que o robô
@@ -94,7 +98,13 @@ Enquanto a thread principal grava um lote, os workers seguem com a fila (até 2�
      esse JSON.
 
   **O robô não resolve nem pula o captcha** e não chama o serviço por fora da página. Se a nota vier baixa, o crédito
-  é adiado (`CAPTCHA_EJUD`) e aquele Chrome descansa 5 min. Com 3 erros seguidos, ele fecha e abre de novo.
+  é adiado (`CAPTCHA_EJUD`) e aquele Chrome descansa 30 min. Com 3 erros seguidos, ele fecha e abre de novo.
+  - **Ritmo conservador** (padrão desde 02/10/2026): 1 Chrome e 5 s entre páginas, ~9 páginas por minuto. Em 01/10,
+    2 Chromes a ~1 página/s cada levaram a nota a 0,1 depois de ~45 min.
+  - **A recusa não para o robô:** ela não conta como falha técnica. Com todos os Chromes em pausa, o robô para de
+    pegar leads, grava o lote pronto, espera a pausa acabar e continua sozinho.
+  - Resposta atrasada de uma página abandonada é descartada: o pedido de dados precisa trazer o número do processo
+    da página atual. Se mesmo assim vierem dados de outro processo, o crédito é adiado e nunca vira FALHA.
 - **Originários migrados para o eproc:** continuam com as partes e todo o histórico no DCP até a migração.
 - O CNJ do precatório (`…8.19.0801`) é calculado a partir do número antigo (conferido com o eJUD) e fica no metadata.
 

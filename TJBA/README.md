@@ -117,13 +117,30 @@ Na ordem (forte, ligado, pista do RPA, DJEN), cada candidato é confirmado:
 
 1. pela capa que **já está no banco** (`partes_do_banco`): beneficiário no polo ativo com CPF/CNPJ válido e ente no
    passivo — sem abrir o PJe; ou
-2. pelo **PJe 1º grau** (`https://consultapublicapje.tjba.jus.br/pje/ConsultaPublica/listView.seam`, até 10 por
-   crédito): digita o número, clica em Pesquisar, abre o detalhe, lê a capa (`campos_da_capa`: classe, assunto,
-   jurisdição, órgão julgador, data) e as partes das tabelas de polo ativo e passivo, virando as páginas (até 50;
-   `completa = False` se passou disso). O HTML não é guardado em disco.
+2. pelo **PJe 1º grau** (`https://consultapublicapje.tjba.jus.br/pje/ConsultaPublica/listView.seam`): lê a capa
+   (`campos_da_capa`: classe, assunto, jurisdição, órgão julgador, data) e as partes das tabelas de polo ativo e
+   passivo, virando as páginas (até 50; `completa = False` se passou disso). O HTML não é guardado em disco.
+   - **O captcha é por pesquisa, não por sessão** (testado em 02/10/2026): o servidor confere o ticket e recusa o
+     repetido, o vazio e o inventado ("A verificação de captcha não está correta"). Não dá para reaproveitar a
+     sessão como no TJRR. Mas o **link do detalhe (`?ca=`) abre sem captcha, por HTTP puro** (sessão `requests`
+     nova), e as páginas de partes também (o POST AJAX do paginador, montado do próprio HTML: `detalhe_http`).
+   - Por isso, no 1º candidato que precisa do PJe, o robô faz **1 pesquisa pelo nome do beneficiário**
+     (`pesquisar_nome`, 1 captcha): a 1ª página traz até 30 processos da pessoa (classe, número, "polo ativo X
+     polo passivo") com o link de cada um. A 2ª página pede outro captcha, então nome comum (mais de 30) fica só
+     com a 1ª (aviso no log). Espólio com inventariante: o 2º nome só é pesquisado se ainda faltar candidato.
+   - Candidato com link conhecido abre por HTTP (até 30 por crédito, ~0,5 s cada); o que não veio na pesquisa por
+     nome é pesquisado pelo número como antes (1 captcha cada, até 10 por crédito). Os links ficam na memória do
+     worker (até 50 mil); link que não abre mais sai dela e o processo é pesquisado pelo número.
+   - **Nenhum candidato confirmado (ou nenhum candidato no DJEN/RPA)**: os processos da pesquisa por nome com o ente
+     no polo passivo da linha, de 1º grau do TJBA e não mais novos que o precatório, viram candidatos (fonte
+     `PJE_NOME`; cumprimento/execução e os mais novos primeiro) e são conferidos por HTTP com a mesma regra
+     (beneficiário no polo ativo, ente no passivo). A pesquisa por nome que trava aqui adia o crédito (`ADIADO`),
+     não vira FALHA; no atalho do 1º candidato o robô só segue pelo número.
    - **Captcha Tencent** (slider): o robô baixa o fundo e a peça, acha o buraco com OpenCV (bordas Canny +
      `matchTemplate`) e arrasta o slider com aceleração, tremor e leve passada do ponto. Até 4 imagens por espera;
      depois disso `CAPTCHA_REATIVADO`.
+   - A linha do log mostra os acessos ao PJe do crédito: `PJe 1 nome/0 nº/3 http` (pesquisas por nome, pesquisas
+     por número, detalhes por HTTP); o mesmo vai em `coleta_credor_tentativa.detalhe.acessos_pje`.
 
 Para quando o desempate prévio é confirmado. Passou de 15 min no crédito -> `TIMEOUT_PAGINA_PROCESSO`.
 
@@ -136,8 +153,19 @@ Para quando o desempate prévio é confirmado. Passou de 15 min no crédito -> `
 | escolhido, mas o PJe não mostra o CPF | `FALHA` / `SEM_CPF_CREDOR` | sim |
 | vários confirmados sem desempate | `SUCESSO_ANALISAR` / `CREDOR_COM_DOCUMENTO_SEM_VINCULO:<cnjs>` | não (grava as capas) |
 | idem, e todos são a mesma pessoa (mesmo CPF/CNPJ válido) sem candidato por conferir | `SUCESSO_ANALISAR`, regra `CREDOR_UNICO` | não, mas **liga o credor** ao crédito (`registrar_credor`, sem processo) |
-| 1 candidato claro que o PJe público não abre | `FALHA` / `PROC_SEM_CAPA` | sim (sem capa) |
+| 1 candidato claro que o PJe público não deixa ler (não achado, ou achado sem link: ver abaixo) | `FALHA` / `PROC_SEM_CAPA` | sim (sem capa) |
+| idem, e os processos achados pelo nome (beneficiário no ativo, ente no passivo) têm todos o mesmo CPF/CNPJ válido | `SUCESSO_ANALISAR` / `PROC_SEM_CAPA_CREDOR_OUTRO_PROCESSO`, regra `CREDOR_OUTRO_PROCESSO` | sim (sem capa), e **liga o credor** sem processo |
 | nenhum confirmado | `FALHA` / `PROCESSO_NAO_ENCONTRADO` | não |
+
+**Processo achado sem link para o detalhe** (visto em 05/10/2026, ex.: 8031939-09.2021.8.05.0001). A pesquisa traz a
+linha ("1 resultados encontrados", classe, número e "1ª parte do polo ativo X 1ª do passivo"), mas sem o "Ver
+detalhes" e sem a última movimentação: o detalhe não é público e não abre por outro caminho (o id interno da linha
+não serve no `DetalheProcessoConsultaPublica`). Antes o robô esperava o link por 90 s, dava `PESQUISA_SEM_RESPOSTA`,
+pesquisava de novo e adiava o crédito, para sempre. Agora `Pje.sem_detalhe` reconhece a resposta na hora
+(`'processosGridCount'` ≥ 1 sem link) e o candidato fica `pje = SEM_DETALHE`, com a `linha` guardada em
+`candidatos`. Se ele é o candidato claro (DJEN, evidência forte, ou a linha mostra o beneficiário no ativo e o ente
+no passivo: `linha_confere`), vira `PROC_SEM_CAPA`; o CPF pode vir de outros processos da pessoa (linha acima). Nesse
+caso os processos achados pelo nome não disputam o originário com ele.
 
 **Erro passageiro** (captcha, PJe/DJEN fora do ar, timeout, navegador caiu — `ErroTecnico`) ou inesperado: o crédito
 volta para a fila em 30 min (`fila_credor_adiar`), vira linha `ADIADO` no log e **nunca vira FALHA**. 5 falhas

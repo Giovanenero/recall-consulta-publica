@@ -1434,6 +1434,20 @@ def corrigir_credor(cur, lead, credor, bk):
     return corrigidos
 
 
+def outros_credores_no_banco(cur, originario, credor, credito_id):
+    """Quantos credores (com pessoa) o processo já tem no banco além do credor confirmado, quando nenhum outro crédito
+    está ligado a ele. Nesse caso o recálculo do banco (recalcular_credores_do_processo, dentro do registrar_capa)
+    ligaria todos eles como credores deste crédito; com 2 ou mais créditos ligados ele não liga credor nenhum."""
+    cur.execute("""SELECT count(*) FROM creditos.processo_parte pa JOIN creditos.processo pr ON pr.id = pa.processo_id
+                    WHERE pr.numero_cnj = creditos.cnj_normalizar(%s) AND pa.papel_id = 1 AND pa.pessoa_id IS NOT NULL
+                      AND pa.pessoa_id IS DISTINCT FROM (SELECT id FROM creditos.pessoa
+                                                          WHERE documento = creditos.documento_normalizar(%s))
+                      AND NOT EXISTS (SELECT 1 FROM creditos.credito_originario co
+                                       WHERE co.processo_id = pr.id AND co.credito_id <> %s)""",
+                (formatar_cnj(originario), (credor or {}).get("documento"), credito_id))
+    return cur.fetchone()[0]
+
+
 def gravar(cur, lead, r, filas, status_legado, bk):
     """Grava o resultado de um crédito (quem chama cuida do SAVEPOINT e do COMMIT). Devolve o resumo para o CSV."""
     cid = lead["credito_id"]
@@ -1441,6 +1455,16 @@ def gravar(cur, lead, r, filas, status_legado, bk):
     antes = credores_do_credito(cur, cid)
     resumo, legado, proc, corrigidos = "", Counter(), None, []
     vincula = r["originario"] and r["status"] in STATUS_COM_VINCULO
+    if vincula:
+        outros = outros_credores_no_banco(cur, r["originario"], r["credor"], cid)
+        if outros:
+            # ação coletiva que já está no banco: ligar o originário faria o recálculo ligar os outros autores como
+            # credores deste crédito; liga só o credor confirmado
+            vincula = False
+            r["liga_credor"] = True
+            r["motivo"] = (f"ORIGINARIO_COLETIVO_NAO_LIGADO: {formatar_cnj(r['originario'])} já tem {outros} outro(s) "
+                           f"credor(es) no banco; {r['motivo']}")[:2000]
+            legado["coletivo_nao_ligado"] += 1
     if vincula:
         cur.execute("SELECT creditos.fila_credor_registrar_originario(%s, %s, %s)",
                     (cid, WORKER, [formatar_cnj(r["originario"])]))
