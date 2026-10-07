@@ -1,12 +1,13 @@
 """
 fetch_TJMT.py - credor dos precatórios do TJMT pela consulta pública, de ponta a ponta, sem navegador e sem login:
 lê o banco, acha o credor (DJEN + consulta processual do TJMT), confirma o originário e grava no banco em lotes de
-LOTE créditos (LOTE_GRAVACAO_TJMT no .env). No lugar do modo credor do RPA_SISTEMAS, que não abre os precatórios do
+LOTE créditos (constante abaixo). No lugar do modo credor do RPA_SISTEMAS, que não abre os precatórios do
 TJMT (são sigilosos no PJe: 12 mil tentativas do RPA deram PROCESSO_NAO_ENCONTRADO).
 
 A lista do TJMT não traz o beneficiário nem o originário, e o precatório é sigiloso, então:
 1. Fila: não pagos primeiro (Situação da lista), depois prioridade de campanha, sem credor antes de com credor e maior
-   valor. Cada crédito é reservado com lease (reservar) e só nessa hora passa do RPA para o software próprio
+   valor. Cada crédito é reservado com lease (reservar), também nas filas mensais do RPA
+   antigo (CREDOR_EM_ANDAMENTO com a marca do robô: o RPA não o pega), e só nessa hora passa do RPA para o software próprio
    (CONSULTA_PUBLICA_TJMT); o que o RPA tinha fica em desfazer_fila_*.sql.
 2. DJEN pelo nº do precatório: o credor vem só em INICIAIS no polo A ('J. P. S.', com as partículas: 'J. P. D. S.' =
    JOAO PEREIRA DA SILVA) e os advogados vêm com nome e OAB. Precatório antigo (sistema legado, até 2019): a consulta
@@ -74,29 +75,25 @@ if str(AQUI.parent) not in sys.path:
 from utils import banco  # noqa: E402
 from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
+from utils.legado import (limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
+                          reservar_filas_mensais, soltar_filas_mensais)
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
 # =============================================================================== configuração
 
 SAIDA = AQUI / "saida"
-load_dotenv(AQUI.parent / ".env")      # PG_*, LOTE_GRAVACAO_TJMT e (com --proxies) PROXY_01..05
+load_dotenv(AQUI.parent / ".env")      # PG_* e (com --proxies) PROXY_01..05
 log = logging.getLogger("fetch_TJMT")
-
-
-def lote_do_env():
-    """Créditos por transação de gravação, de LOTE_GRAVACAO_TJMT no .env (inteiro maior que zero)."""
-    valor = os.environ.get("LOTE_GRAVACAO_TJMT", "").strip()
-    if not valor.isdigit() or int(valor) < 1:
-        raise SystemExit(f"LOTE_GRAVACAO_TJMT no .env precisa ser um inteiro maior que zero (veio {valor!r}).")
-    return int(valor)
 
 
 TRIBUNAL_TJMT = 111
 SOFTWARE = "CONSULTA_PUBLICA_TJMT"
+GERAR_DESFAZER = True                  # False com --sem-desfazer (modo 5 do RPA_SISTEMAS): não escreve os arquivos de desfazer
 SOFTWARE_RPA = 2                       # RPA_CREDOR_V1
 WORKER = f"{socket.gethostname()}:TJMT:consulta_publica:{os.getpid()}"
-LOTE = lote_do_env()                   # créditos por transação de gravação
+LOTE = 20                              # créditos por transação de gravação
+FILAS_MENSAIS = []                     # filas do RPA antigo com permissão de UPDATE (a Rodada preenche): reserva e status
 WORKERS = 4                            # workers (threads deste processo) raspando ao mesmo tempo (--workers)
 TETO_CREDITO = 10 * 60                 # s por crédito; passou disso, volta para a fila (1ª lista de um advogado grande)
 ADIAMENTO = "30 minutes"               # erro passageiro
@@ -194,6 +191,11 @@ SEM_GRAVACAO = {"banco": "", "legado": "", "antes": set(), "depois": set(), "cor
 
 class ErroTecnico(Exception):
     """Falha passageira (DJEN/TJMT fora do ar, timeout): o crédito volta para a fila, não vira FALHA."""
+
+
+class PaginaQuebrada(ErroTecnico):
+    """HTTP 400 'Invalid pattern' da consulta do TJMT: um registro da página tem nome que quebra a pesquisa do
+    servidor (ex.: '*renato aparecido ferreira'). Não passa sozinho; a Consulta refaz a página em pedaços e pula só ele."""
 
 # =============================================================================== utilidades
 
@@ -580,6 +582,8 @@ class Consulta:
                     raise ErroTecnico("CAPTCHA_REATIVADO: a consulta processual do TJMT passou a exigir captcha")
                 if r.status_code == 422:
                     raise ErroTecnico(f"PESQUISA_SEM_RESPOSTA: a API recusou a pesquisa ({r.text[:150]})")
+                if r.status_code == 400 and "Invalid pattern" in r.text[:500]:
+                    raise PaginaQuebrada(f"PAGINA_QUEBRADA: {r.text[:150]}")
                 if r.status_code in HTTP_FREIA:
                     self.ritmo.freia(erro)
             except (requests.RequestException, ValueError) as e:
@@ -589,15 +593,34 @@ class Consulta:
                 raise ErroTecnico("INTERROMPIDO")
         raise ErroTecnico(f"PESQUISA_SEM_RESPOSTA: a consulta do TJMT não respondeu ({erro})")
 
+    def itens(self, skip, take, **params):
+        """(itens, total) das linhas skip..skip+take da pesquisa. Página quebrada no servidor (PaginaQuebrada): refaz
+        em pedaços de 10 e depois de 1 e pula só o registro que quebra (total None se nenhum pedaço respondeu)."""
+        try:
+            d = self.pagina(Skip=skip, Take=take, **params)
+            return d.get("itens") or [], d.get("totalRegistros") or 0
+        except PaginaQuebrada as e:
+            if take == 1:
+                log.warning(f"consulta do TJMT: registro {skip} pulado, quebra a pesquisa do servidor ({e}) | {params}")
+                return [], None
+        passo = 10 if take > 10 else 1
+        itens, total = [], None
+        for sub in range(skip, skip + take, passo):
+            if total is not None and sub >= total:
+                break
+            parte, t = self.itens(sub, min(passo, skip + take - sub), **params)
+            itens += parte
+            total = t if t is not None else total
+        return itens, total
+
     def todos(self, prazo, max_paginas=MAX_PAGINAS_ADVOGADO, **params):
         """(processos enxutos, total, cortou) de todas as páginas da pesquisa, até max_paginas."""
         processos, total = [], 0
         for pg in range(max_paginas):
             if time.time() > prazo:
                 raise ErroTecnico(f"TIMEOUT_PAGINA_PROCESSO: passou de {TETO_CREDITO // 60} min no crédito")
-            d = self.pagina(Skip=pg * TAKE, Take=TAKE, ExibirArquivados="true", **params)
-            itens = d.get("itens") or []
-            total = d.get("totalRegistros") or 0
+            itens, total = self.itens(pg * TAKE, TAKE, ExibirArquivados="true", **params)
+            total = total or 0
             processos += [enxugar(p) for p in itens]
             if not itens or (pg + 1) * TAKE >= total:
                 return processos, total, False
@@ -629,7 +652,7 @@ class Consulta:
 
     def por_numero(self, numero20):
         """Processos com este número (o mesmo número aparece no 1º e no 2º grau)."""
-        return [enxugar(p) for p in self.pagina(numeroUnico=numero20, Skip=0, Take=10).get("itens") or []]
+        return [enxugar(p) for p in self.itens(0, 10, numeroUnico=numero20)[0]]
 
     def por_nome(self, nome, termo_ente, prazo):
         """Processos com a parte pelo nome inteiro (e o ente no polo passivo). Nome comum dá milhares: só as
@@ -1104,7 +1127,7 @@ class Backup:
     def confirmar_lote(self, manter):
         """Depois do COMMIT (ou do ROLLBACK da simulação): escreve o SQL e o CSV de cada crédito do lote;
         manter=False (simulação) não lembra as linhas tocadas."""
-        for credito_id, sql, linhas in self.l_creditos:
+        for credito_id, sql, linhas in (self.l_creditos if GERAR_DESFAZER else []):
             novo = not self.arquivo_sql.exists()
             with open(self.arquivo_sql, "a", encoding="utf-8") as f:
                 if novo:
@@ -1344,13 +1367,17 @@ def atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk):
                                         creditos.so_digitos(numero_precatorio)) = %s
                            FOR UPDATE""", (lead["numero_norm"][:20].rjust(20, "0"), lead["numero_norm"]))
         for linha in como_dicts(cur):
-            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO":
+            reservada = reserva_de_robo(linha)
+            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO" and not reservada:
                 cont["fila_pulada"] += 1
                 continue
             chave = {"id_processo": linha["id_processo"], "numero_precatorio": linha["numero_precatorio"],
                      "tribunal_origem": "TJMT"}
-            bk.update(cur, fila, chave, {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead",
-                                                             "numero_originario", "ultima_atualizacao")})
+            antes = {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead", "numero_originario",
+                                           "ultima_atualizacao")}
+            if reservada:
+                antes.update(status_coleta_lead=None, motivo_coleta_lead=None)
+            bk.update(cur, fila, chave, antes)
             cur.execute(f"""UPDATE {fila}
                                SET status_coleta_lead = %s, motivo_coleta_lead = %s,
                                    numero_originario = COALESCE(%s::text[], numero_originario),
@@ -1525,6 +1552,7 @@ def marcar_falha(cur, credito_id, erro):
     falhar, o lote segue)."""
     cur.execute("SAVEPOINT falha")
     try:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJMT", WORKER)
         cur.execute("""SELECT creditos.fila_credor_finalizar(p_credito_id => %s, p_worker => %s,
                           p_status => 'FALHA', p_motivo => %s, p_sistema => 'PJE', p_host => %s)""",
                     (credito_id, WORKER, erro, socket.gethostname()))
@@ -1645,7 +1673,9 @@ def descarregar(rod, pendentes):
 def reservar(con, credito_id, lease, id_software):
     """Reserva UM crédito (lease para este worker) se ele ainda é pegável, passando-o para o software do robô nesse
     momento (a fila do RPA só muda lead a lead, no que o robô de fato pega). UPDATE atômico: se outra instância já o
-    pegou, não afeta nenhuma linha. Devolve (software, status, disponivel_em) de antes, ou None."""
+    pegou, não afeta nenhuma linha. Na mesma transação reserva as linhas do precatório nas filas mensais do RPA antigo;
+    se o RPA (token A3) está com uma delas, desfaz tudo e não pega. Devolve (software, status, disponivel_em) de antes,
+    ou None."""
     with con.cursor() as cur:
         cur.execute(f"""WITH alvo AS (
                           SELECT cc.credito_id, cc.software_id, cc.status_id, cc.disponivel_em
@@ -1662,6 +1692,11 @@ def reservar(con, credito_id, lease, id_software):
                         RETURNING alvo.software_id, alvo.status_id, alvo.disponivel_em""",
                     (credito_id, TRIBUNAL_TJMT, id_software, WORKER, lease))
         antes = cur.fetchone()
+        if antes and not reservar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJMT",
+                                                WORKER):
+            con.rollback()
+            log.info(f"{credito_id}: o RPA está processando o precatório (fila mensal em andamento); fica para depois")
+            return None
     con.commit()
     return antes
 
@@ -1669,7 +1704,7 @@ def reservar(con, credito_id, lease, id_software):
 def anotar_desfazer_fila(rod, credito_id, antes):
     """Lead que era do RPA: guarda o UPDATE que o devolve ao RPA com o status de antes (desfazer_fila_<rodada>.sql)."""
     software, status, disponivel = antes
-    if software != SOFTWARE_RPA:
+    if software != SOFTWARE_RPA or not GERAR_DESFAZER:
         return
     arquivo = SAIDA / f"desfazer_fila_{rod.rodada}.sql"
     novo = not arquivo.exists()
@@ -1701,6 +1736,7 @@ def pegar(rod):
 def devolver(con, credito_id, motivo=None, intervalo=ADIAMENTO):
     """Volta para a fila daqui a `intervalo` (erro passageiro, sem publicação); sem motivo (Ctrl+C), volta já."""
     with con.cursor() as cur:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJMT", WORKER)
         if motivo:
             cur.execute("SELECT creditos.fila_credor_adiar(%s, %s, %s::interval, %s)",
                         (credito_id, WORKER, intervalo, motivo[:2000]))
@@ -1738,6 +1774,7 @@ class Rodada:
             cur.execute("SELECT codigo, codigo_legado FROM creditos.status_coleta")
             self.status_legado = {codigo: legado or codigo for codigo, legado in cur.fetchall()}
         self.con.commit()
+        FILAS_MENSAIS[:] = self.filas
         self.djen = Djen(self.parar, usar_proxies)
         self.djen.carregar_presidencia()
         self.consulta = Consulta(self.parar, ritmo)
@@ -1768,7 +1805,13 @@ class Rodada:
         return ordem
 
     def reordenar(self):
-        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA)."""
+        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA). Antes, solta nas filas
+        mensais as reservas de robô que ficaram sem dono (robô que caiu)."""
+        with self.con.cursor() as cur:
+            soltas = limpar_reservas_orfas(cur, self.filas, "TJMT")
+        self.con.commit()
+        if soltas:
+            log.info(f"filas mensais: {soltas} reserva(s) de robô sem dono soltas")
         self.ordem, self.posicao, self.ultima_ordem = self.ordenar(), 0, time.time()
 
     def reconectar(self):
@@ -1778,6 +1821,18 @@ class Rodada:
         except Exception:
             pass
         self.con = conectar(escrita=True)
+
+    def renovar_conexoes(self):
+        """Depois de uma espera longa: o Postgres derruba sessão parada há mais de 15 min (idle_session_timeout).
+        Abre a conexão de escrita de novo e fecha as de leitura das threads (cada uma reabre a sua na próxima leitura)."""
+        self.reconectar()
+        with self.trava:
+            for con in self.conexoes:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            self.conexoes.clear()
 
     def conexao_da_thread(self):
         """Conexão de leitura da thread que chama; criada na 1ª vez (e de novo se a anterior caiu)."""
@@ -1842,6 +1897,7 @@ def esperar_adiados(rod):
     log.info(f"fila vazia, mas há crédito adiado que vence em {espera / 60:.0f} min: esperando para continuar")
     if rod.parar.wait(espera):
         return False
+    rod.renovar_conexoes()
     rod.fila_vazia = False
     rod.reordenar()
     return True
@@ -1853,8 +1909,13 @@ def processar_credito(rod, credito_id, n):
     inicio = time.time()
     linha = {"processado_em": datetime.now().isoformat(timespec="seconds"), "modo": rod.modo, "credito_id": credito_id}
     try:
-        with rod.conexao_da_thread().cursor() as cur:
-            lead = ler_credito(cur, credito_id)
+        try:
+            with rod.conexao_da_thread().cursor() as cur:
+                lead = ler_credito(cur, credito_id)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            rod.local.con = None                        # conexão de leitura parada demais e derrubada: abre outra
+            with rod.conexao_da_thread().cursor() as cur:
+                lead = ler_credito(cur, credito_id)
         linha.update(precatorio=lead["precatorio"], faixa=lead["faixa"], ente=lead["ente"],
                      ultimo_status=lead["ultimo_status"])
         r = processar(lead, rod.djen, rod.consulta, inicio)
@@ -1943,7 +2004,12 @@ def ler_argumentos():
                     help="só na simulação: ids de crédito separados por vírgula (no lugar dos primeiros da fila)")
     ap.add_argument("--proxies", action="store_true",
                     help="soma PROXY_01..05 do .env como saídas do DJEN (precisam sair pelo Brasil)")
-    return ap.parse_args()
+    ap.add_argument("--sem-desfazer", action="store_true",
+                    help="não escreve os arquivos de desfazer (como os outros tribunais do modo 5 do RPA)")
+    args = ap.parse_args()
+    global GERAR_DESFAZER
+    GERAR_DESFAZER = not args.sem_desfazer
+    return args
 
 
 def executar(args, creditos):

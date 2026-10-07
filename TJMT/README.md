@@ -28,9 +28,19 @@ python TJMT/fetch_TJMT.py --workers 4 --ritmo 4             # padrão: 4 threads
 **Rodar até acabar a carga:** com a fila vazia, o robô espera os créditos adiados por erro passageiro (30 min) e
 continua; termina quando só sobram os sem publicação (voltam em 15 dias). Se uma rodada para (TJMT ou DJEN fora,
 8 falhas técnicas seguidas, banco caiu, erro inesperado), começa outra depois de 5 min, até 30 vezes. Conexão de
-escrita que cai no meio de um lote: reconecta e grava o lote de novo.
+escrita que cai no meio de um lote: reconecta e grava o lote de novo. O Postgres derruba sessão parada há mais de
+15 min (`idle_session_timeout`): depois da espera pelos adiados o robô abre conexões novas, e a leitura do crédito
+tenta de novo uma vez com conexão nova.
 
-- **`.env`:** `PG_*` e `LOTE_GRAVACAO_TJMT` (créditos por transação, inteiro maior que zero).
+**Página quebrada na consulta do TJMT:** algumas listas (ex.: advogada VALDELICY MARIA MONTEIRO sem filtro de ente)
+têm um registro cujo nome quebra a pesquisa do próprio servidor (HTTP 400 `Invalid pattern '*renato aparecido
+ferreira'`). Não passa sozinho; o robô refaz a página em pedaços de 10 e de 1 e pula só esse registro (aviso no log
+"registro N pulado").
+
+- **`.env`:** `PG_*`. O lote de gravação (créditos por transação) é a constante `LOTE` no início do robô (20).
+- **Reserva:** cada lead pego fica reservado também nas filas mensais do RPA antigo (`CREDOR_EM_ANDAMENTO` com o
+  motivo `CONSULTA_PUBLICA_RESERVA: <worker>`), para o RPA com token A3 não o pegar; a gravação troca a marca pelo
+  resultado e a devolução (erro passageiro, Ctrl+C) a solta. Ver `utils/legado.py`.
 - **Ritmo:** DJEN a 0,8 s por consulta (sobe sozinho com 429; o limite é por IP e dividido com os outros robôs da
   máquina). A consulta do TJMT tem ritmo global que freia sozinho (403, 429, 502-504, timeout: metade do ritmo e
   60 s de pausa) e sobe 10% a cada 200 respostas boas.
