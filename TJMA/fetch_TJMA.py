@@ -1,11 +1,12 @@
 """
 fetch_TJMA.py - credor dos precatórios do TJMA pela consulta pública, de ponta a ponta, sem navegador e sem login:
 lê o banco, acha o credor (DJEN), acha e confirma o originário (PJe 1º grau público, HTTP puro) e grava no banco em
-lotes de LOTE créditos (LOTE_GRAVACAO_TJMA no .env). No lugar do modo credor do RPA_SISTEMAS (token A3 no PJe 2º grau).
+lotes de LOTE créditos (constante abaixo). No lugar do modo credor do RPA_SISTEMAS (token A3 no PJe 2º grau).
 
 A lista do TJMA não traz o beneficiário (a Res. CNJ 303 veda) e o PJe 2º grau público não abre precatório, então:
 1. Fila: ordem própria, não pagos primeiro (lista vigente e PDFs de pagos do hotsite do TJMA), e dentro de cada faixa
-   campanha, sem credor antes de com credor e maior valor. Cada crédito é reservado com lease (reservar) e só nessa
+   campanha, sem credor antes de com credor e maior valor. Cada crédito é reservado com lease (reservar), também nas
+   filas mensais do RPA antigo (CREDOR_EM_ANDAMENTO com a marca do robô: o RPA não o pega), e só nessa
    hora passa do RPA para o software próprio (CONSULTA_PUBLICA_TJMA); o que o RPA tinha fica em desfazer_fila_*.sql.
 2. DJEN pelo nº do precatório: o nome do credor (o texto traz 'CREDOR: E. S. D. A.' e os destinatários trazem o nome
    inteiro; as iniciais escolhem o destinatário certo), as OABs dos advogados e os CNJs de 1º grau citados no texto.
@@ -55,7 +56,7 @@ import time
 import unicodedata
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urljoin
@@ -73,6 +74,8 @@ if str(AQUI.parent) not in sys.path:
 from utils import banco  # noqa: E402
 from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
+from utils.legado import (limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
+                          reservar_filas_mensais, soltar_filas_mensais)
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
@@ -81,23 +84,16 @@ from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 SAIDA = AQUI / "saida"
 PASTA_HTML = SAIDA / "pje1g_html"
 PASTA_PDF = SAIDA / "pdf_tjma"          # números já extraídos de cada PDF do hotsite (o nome do arquivo muda a cada edição)
-load_dotenv(AQUI.parent / ".env")      # PG_*, LOTE_GRAVACAO_TJMA e (com --proxies) PROXY_01..05
+load_dotenv(AQUI.parent / ".env")      # PG_* e (com --proxies) PROXY_01..05
 log = logging.getLogger("fetch_TJMA")
-
-
-def lote_do_env():
-    """Créditos por transação de gravação, de LOTE_GRAVACAO_TJMA no .env (inteiro maior que zero)."""
-    valor = os.environ.get("LOTE_GRAVACAO_TJMA", "").strip()
-    if not valor.isdigit() or int(valor) < 1:
-        raise SystemExit(f"LOTE_GRAVACAO_TJMA no .env precisa ser um inteiro maior que zero (veio {valor!r}).")
-    return int(valor)
-
 
 TRIBUNAL_TJMA = 110
 SOFTWARE = "CONSULTA_PUBLICA_TJMA"
+GERAR_DESFAZER = True                  # False com --sem-desfazer (modo 5 do RPA_SISTEMAS): não escreve os arquivos de desfazer
 SOFTWARE_RPA = 2                       # RPA_CREDOR_V1
 WORKER = f"{socket.gethostname()}:TJMA:consulta_publica:{os.getpid()}"
-LOTE = lote_do_env()                   # créditos por transação de gravação
+LOTE = 20                              # créditos por transação de gravação
+FILAS_MENSAIS = []                     # filas do RPA antigo com permissão de UPDATE (a Rodada preenche): reserva e status
 WORKERS = 6                            # workers (threads deste processo) raspando ao mesmo tempo (--workers)
 TETO_CREDITO = 5 * 60                  # s por crédito; passou disso, volta para a fila
 ADIAMENTO = "30 minutes"               # erro passageiro
@@ -132,6 +128,8 @@ CAMPO_AUTUACAO_ATE = "fPP:dataAutuacaoDecoration:dataAutuacaoFimInputDate"
 LIMITE_PESQUISA = 30                   # o portal corta a pesquisa em 30 resultados
 TIMEOUT_PJE = 90
 MAX_ABERTOS_PJE = 8                    # detalhes abertos no PJe por crédito
+JANELA_ADVOGADO_DJEN = 3 * 365         # dias de publicações do advogado-credor no DJEN (achar processo dele no PJe)
+MAX_PROCESSOS_CPF_ADVOGADO = 3         # processos abertos no PJe para ler o CPF do advogado-credor
 MAX_PAGINAS_PARTES = 60
 MAX_PAGINAS_PASSIVO = 5
 TETO_DETALHE = 90                      # s virando páginas de partes num detalhe (ação coletiva enorme)
@@ -175,7 +173,7 @@ RE_LINHA = re.compile(r'<tr class="rich-table-row[^"]*">(.*?)</tr>', re.S)
 # "BELTRANO - OAB MA12345 - CPF: ... (ADVOGADO)"
 RE_PARTE = re.compile(
     r"([A-ZÁÂÃÀÉÊÍÓÔÕÚÜÇ][A-Za-zÁÂÃÀÉÊÍÓÔÕÚÜÇáâãàéêíóôõúüç&\.\-\s']{3,90}?)"
-    r"(?:\s*-\s*OAB\s*([A-Z]{2})\s*(\d+[A-Z]?))?"
+    r"(?:\s*-\s*OAB\s*([A-Z]{2})\s*0*(\d+)(?:-?[A-Z])?)?"    # 'OAB MA8135-A' (suplementar): número 8135
     r"(?:\s*-\s*(CPF|CNPJ):\s*([\d\.\-/\*]{11,20}))?"
     r"\s*\(([A-ZÁÂÃÀÉÊÍÓÔÕÚÜÇ][A-ZÁÂÃÀÉÊÍÓÔÕÚÜÇ\s/\.\-]{2,39})\)")
 RE_ADVOGADO = re.compile(r"ADVOGAD|PROCURADOR|DEFENSOR", re.I)
@@ -458,7 +456,7 @@ def credor_do_djen(itens, chaves, estadual):
     O credor sai do rótulo 'CREDOR:' do texto; se o rótulo vem em iniciais, do destinatário com as mesmas iniciais;
     sem rótulo, do destinatário (fora ente, advogados e cessionários) que mais aparece."""
     rotulos, cessionarios, destinatarios = Counter(), set(), Counter()
-    advogados, oabs, citados = set(), set(), set()
+    advogados, oabs, citados, por_oab, ativos = set(), set(), set(), {}, set()
     for it in itens:
         texto = it["texto"]
         for m in RE_ROTULO_CREDOR.finditer(texto):
@@ -471,9 +469,13 @@ def credor_do_djen(itens, chaves, estadual):
                 cessionarios.add(chave_nome(v))
         advogados |= {chave_nome(a["nome"]) for a in it["advogados"]}
         oabs |= {a["oab"] + a["uf"] for a in it["advogados"]}
-        for _polo, nome in it["partes"]:
+        for a in it["advogados"]:
+            por_oab.setdefault(a["oab"] + a["uf"], a)
+        for polo, nome in it["partes"]:
             if nome.strip():
                 destinatarios[" ".join(nome.split())] += 1
+                if polo == "A":
+                    ativos.add(" ".join(nome.split()))
         citados |= {n for n in (so_digitos(c) for c in CNJ.findall(texto)) if cnj_1g_tjma(n)}
     possiveis = Counter({n: q for n, q in destinatarios.items()
                          if chave_nome(n) not in advogados and chave_nome(n) not in cessionarios
@@ -492,7 +494,23 @@ def credor_do_djen(itens, chaves, estadual):
             vistos.add(chave_nome(n))
             unicos.append(n)
     return {"nomes": unicos, "oabs": oabs, "citados": citados, "cessao": bool(cessionarios),
-            "rotulos": list(rotulos), "publicacoes": len(itens)}
+            "rotulos": list(rotulos), "publicacoes": len(itens), "advogados": list(por_oab.values()),
+            "ativos": sorted(ativos)}
+
+
+def advogado_credor(info):
+    """O advogado do precatório que é o próprio credor (causa própria/honorários), ou None. O TJMA publica 'CREDOR: R. A. T.
+    Advogados do(a) REQUERENTE: R. A. T. - PE19443' e o DJEN traz o nome inteiro dele entre os advogados: as iniciais do
+    rótulo batem com um advogado só. Sem rótulo: o polo A dos destinatários é um advogado do precatório, e só ele."""
+    ini = {iniciais(v) for v in info["rotulos"] if eh_iniciais(v)}
+    if ini:
+        batem = {chave_nome(a["nome"]): a for a in info["advogados"] if iniciais(a["nome"]) in ini}
+        return next(iter(batem.values())) if len(batem) == 1 else None
+    por_nome = {chave_nome(a["nome"]): a for a in info["advogados"]}
+    ativos = {chave_nome(n) for n in info["ativos"]}
+    if not info["rotulos"] and len(ativos) == 1 and ativos <= set(por_nome):
+        return por_nome[next(iter(ativos))]
+    return None
 
 
 def candidatos_djen_nome(djen, prec20, nomes, alvo, chaves, estadual):
@@ -882,11 +900,35 @@ def confirmar(partes, alvo, lead, iniciais_credor=(), unico_autor=False):
 # =============================================================================== decisão (só lê: banco, DJEN, PJe)
 
 
+def cpf_do_advogado_no_pje(djen, pje, adv, prazo):
+    """(CPF, processo) do advogado pelo PJe 1º grau, quando o banco não tem: os processos em que ele atua (DJEN pela
+    OAB, últimos JANELA_ADVOGADO_DJEN dias) e, em até MAX_PROCESSOS_CPF_ADVOGADO deles, a linha 'NOME - OAB MA8135-A -
+    CPF: ... (ADVOGADO)' das partes. Teste de 07/10/2026: 276 de 281, o 1º processo bastou em 267."""
+    hoje = date.today()
+    pubs = djen.buscar(False, True, numeroOab=adv["oab"], ufOab=adv["uf"], siglaTribunal="TJMA", pagina=1,
+                       itensPorPagina=100,
+                       dataDisponibilizacaoInicio=(hoje - timedelta(days=JANELA_ADVOGADO_DJEN)).isoformat(),
+                       dataDisponibilizacaoFim=hoje.isoformat())
+    numeros = list(dict.fromkeys(i["numero"] for i in pubs if cnj_1g_tjma(i["numero"])))
+    for n in numeros[:MAX_PROCESSOS_CPF_ADVOGADO]:
+        linha = pje.por_numero(n)
+        if not linha:
+            continue
+        dados = pje.detalhe(linha["link"], n, {chave_nome(adv["nome"])}, prazo=prazo)
+        time.sleep(PAUSA_PJE)
+        for p in dados["advogados"]:
+            if p["oab_uf"] == adv["uf"] and p["oab_numero"] == adv["oab"].lstrip("0") \
+                    and documento_valido(p["documento"]):
+                return so_digitos(p["documento"]), n
+    return None, None
+
+
 def resultado_vazio():
     """Resultado a gravar, antes de decidir."""
     return {"status": "FALHA", "motivo": "", "via": "NOME", "originario": None, "regra": "", "fontes": "",
             "credor": None, "capas": [], "candidatos": [], "capa_escolhida": None, "partes_escolhido": [],
-            "credor_djen": "", "publicacoes": 0, "oabs_precatorio": "", "cessao": False, "caminho": ""}
+            "credor_djen": "", "publicacoes": 0, "oabs_precatorio": "", "cessao": False, "caminho": "",
+            "honorarios": None}
 
 
 def processar(cur, lead, djen, pje, inicio):
@@ -1005,6 +1047,28 @@ def processar(cur, lead, djen, pje, inicio):
         if not info["publicacoes"]:
             r.update(status="ADIAR", motivo="AINDA_SEM_PUBLICACAO: precatório sem publicação no DJEN"
                      + (f" (originário conhecido não confirmou: {len(conhecidos)})" if conhecidos else ""))
+            return r
+        if not nomes and (adv := advogado_credor(info)):
+            # o credor do precatório é o próprio advogado (decisão do usuário, 07/10/2026): CREDOR com o CPF que o banco
+            # tem pela OAB e também ADVOGADO (a regra de honorários dos outros robôs); sem CPF no banco, só ADVOGADO
+            cur.execute("""SELECT DISTINCT p.documento::text FROM creditos.pessoa_oab o
+                             JOIN creditos.pessoa p ON p.id = o.pessoa_id
+                            WHERE o.uf::text = %s AND o.numero::text = %s AND p.documento IS NOT NULL""",
+                        (adv["uf"], adv["oab"]))
+            docs = {so_digitos(d) for (d,) in cur.fetchall()}
+            doc = next(iter(docs)) if len(docs) == 1 and documento_valido(next(iter(docs))) else None
+            origem = "CPF pela OAB no banco"
+            if not doc:                                 # o banco não tem: o PJe mostra o CPF ao lado da OAB dele
+                tempo()
+                doc, proc_cpf = cpf_do_advogado_no_pje(djen, pje, adv, inicio + TETO_CREDITO - 15)
+                origem = f"CPF do advogado no PJe ({formatar_cnj(proc_cpf)})" if doc else ""
+            base = f"regra=HONORARIOS_ADVOGADO beneficiario={adv['nome']} oab={adv['uf']}{adv['oab']}"
+            r.update(regra="HONORARIOS_ADVOGADO", via="PRECATORIO", honorarios=adv)
+            if doc:
+                r.update(status="SUCESSO_PROCESSO_CREDITO", credor={"nome": adv["nome"], "documento": doc},
+                         motivo=f"CREDOR_ADVOGADO: o credor do precatório é o próprio advogado, {origem}; {base}")
+            else:
+                r.update(status="SUCESSO_INCOMPLETO", motivo=f"SUCESSO_SEM_CPF: {base} (OAB sem CPF no banco nem no PJe)")
             return r
         if not nomes:
             r["motivo"] = (f"SEM_BENEFICIARIO: credor não identificado nas {info['publicacoes']} publicações do DJEN "
@@ -1185,7 +1249,7 @@ class Backup:
     def confirmar_lote(self, manter):
         """Depois do COMMIT (ou do ROLLBACK da simulação): escreve o SQL e o CSV de cada crédito do lote;
         manter=False (simulação) não lembra as linhas tocadas."""
-        for credito_id, sql, linhas in self.l_creditos:
+        for credito_id, sql, linhas in (self.l_creditos if GERAR_DESFAZER else []):
             novo = not self.arquivo_sql.exists()
             with open(self.arquivo_sql, "a", encoding="utf-8") as f:
                 if novo:
@@ -1342,7 +1406,8 @@ def gravar_capa_legado(cur, cnj, dados, relacionar, precatorio, bk):
 
 
 def atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk):
-    """Status, motivo e originário nas linhas do precatório nas filas mensais (pula o que o RPA está processando)."""
+    """Status, motivo e originário nas linhas do precatório nas filas mensais (pula o que o RPA está processando; a
+    reserva do próprio robô é trocada pelo resultado, e o desfazer devolve a linha vazia, como estava antes dela)."""
     cont = Counter()
     status = status_legado[r["status"]]
     originario = [formatar_cnj(r["originario"])] if r["originario"] else None
@@ -1357,13 +1422,17 @@ def atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk):
                                         creditos.so_digitos(numero_precatorio)) = %s
                            FOR UPDATE""", (lead["numero_norm"][:20].rjust(20, "0"), lead["numero_norm"]))
         for linha in como_dicts(cur):
-            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO":
+            reservada = reserva_de_robo(linha)
+            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO" and not reservada:
                 cont["fila_pulada"] += 1
                 continue
             chave = {"id_processo": linha["id_processo"], "numero_precatorio": linha["numero_precatorio"],
                      "tribunal_origem": "TJMA"}
-            bk.update(cur, fila, chave, {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead",
-                                                             "numero_originario", "ultima_atualizacao")})
+            antes = {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead", "numero_originario",
+                                           "ultima_atualizacao")}
+            if reservada:
+                antes.update(status_coleta_lead=None, motivo_coleta_lead=None)
+            bk.update(cur, fila, chave, antes)
             cur.execute(f"""UPDATE {fila}
                                SET status_coleta_lead = %s, motivo_coleta_lead = %s,
                                    numero_originario = COALESCE(%s::text[], numero_originario),
@@ -1462,6 +1531,30 @@ def recorte_do_credor(dados, credor, oabs_precatorio):
                           if a["polo"] == "ATIVO" and a["oab_numero"] + a["oab_uf"] in oabs_precatorio]}
 
 
+def juntar_cpf_na_oab(cur, cid, adv, cpf, bk):
+    """Advogado-credor com CPF achado agora, que o banco tinha só pela OAB: a mesma pessoa ganha o documento (como o
+    aplicar_contatos faz). Se o CPF já é de outra pessoa, a OAB fica onde estava e o vínculo ADVOGADO deste crédito com
+    a pessoa só-OAB sai: o advogado fica ligado pela pessoa do CPF, sem aparecer duas vezes."""
+    cur.execute("""SELECT p.id FROM creditos.pessoa_oab o JOIN creditos.pessoa p ON p.id = o.pessoa_id
+                    WHERE o.uf = %s::char(2) AND o.numero = creditos.oab_numero_normalizar(%s) AND p.documento IS NULL
+                      FOR UPDATE OF p""", (adv["uf"], adv["oab"]))
+    linha = cur.fetchone()
+    if not linha:
+        return
+    pid = linha[0]
+    cur.execute("SELECT 1 FROM creditos.pessoa WHERE documento = creditos.documento_normalizar(%s)", (cpf,))
+    if not cur.fetchone():
+        bk.update(cur, "creditos.pessoa", {"id": pid}, {"documento": None})
+        cur.execute("UPDATE creditos.pessoa SET documento = creditos.documento_normalizar(%s), updated_at = now() "
+                    "WHERE id = %s", (cpf, pid))
+        return
+    cur.execute("SELECT * FROM creditos.credito_credor WHERE credito_id = %s AND pessoa_id = %s AND papel_id = 2 "
+                "FOR UPDATE", (cid, pid))
+    for linha in como_dicts(cur):
+        bk.delete(cur, "creditos.credito_credor", linha)
+        cur.execute("DELETE FROM creditos.credito_credor WHERE id = %s", (linha["id"],))
+
+
 def gravar(cur, lead, r, filas, status_legado, bk):
     """Grava o resultado de um crédito (quem chama cuida do SAVEPOINT e do COMMIT). Devolve o resumo para o CSV."""
     cid = lead["credito_id"]
@@ -1474,6 +1567,8 @@ def gravar(cur, lead, r, filas, status_legado, bk):
         cur.execute("SELECT id FROM creditos.processo WHERE numero_cnj = creditos.cnj_normalizar(%s)",
                     (formatar_cnj(r["originario"]),))
         proc_escolhido = cur.fetchone()[0]
+    if r["honorarios"] and r["credor"] and r["credor"]["documento"]:
+        juntar_cpf_na_oab(cur, cid, r["honorarios"], r["credor"]["documento"], bk)     # antes de ligar o CREDOR
     if r["credor"] and r["credor"]["documento"]:
         cur.execute("SELECT creditos.documento_de_parte(%s)", (r["credor"]["documento"],))
         # antes do registrar_capa: o vínculo fica com origem FONTE, que o recálculo das partes não apaga
@@ -1482,6 +1577,12 @@ def gravar(cur, lead, r, filas, status_legado, bk):
                                                             p_documento => %s, p_processo_id => %s, p_fonte => %s)""",
                         (cid, r["credor"]["nome"], r["credor"]["documento"], proc_escolhido, SOFTWARE))
             corrigidos = corrigir_credor(cur, lead, r["credor"], bk)
+    if r["honorarios"]:                                 # o advogado que é o credor também fica como ADVOGADO
+        h = r["honorarios"]
+        cur.execute("""SELECT creditos.registrar_credor(p_credito_id => %s, p_papel => 'ADVOGADO', p_nome => %s,
+                                                        p_documento => %s, p_oab_uf => %s, p_oab_numero => %s,
+                                                        p_fonte => %s)""",
+                    (cid, h["nome"], (r["credor"] or {}).get("documento"), h["uf"], h["oab"], SOFTWARE))
     # capa só do originário escolhido e só quando veio do PJe (a do banco não traz nada novo e o registrar_capa
     # recalcularia os credores do processo inteiro); na ação coletiva, só o credor
     coletiva = 0
@@ -1530,6 +1631,7 @@ def marcar_falha(cur, credito_id, erro):
     falhar, o lote segue)."""
     cur.execute("SAVEPOINT falha")
     try:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJMA", WORKER)
         cur.execute("""SELECT creditos.fila_credor_finalizar(p_credito_id => %s, p_worker => %s,
                           p_status => 'FALHA', p_motivo => %s, p_sistema => 'PJE', p_host => %s)""",
                     (credito_id, WORKER, erro, socket.gethostname()))
@@ -1643,7 +1745,9 @@ FILTRO_PEGAVEL = f"""cc.disponivel_em <= now() AND (
 def reservar(con, credito_id, lease, id_software):
     """Reserva UM crédito (lease para este worker) se ele ainda é pegável, passando-o para o software do robô nesse
     momento (a fila do RPA só muda lead a lead, no que o robô de fato pega). UPDATE atômico: se outra instância já o
-    pegou, não afeta nenhuma linha. Devolve (software, status, disponivel_em) de antes, ou None."""
+    pegou, não afeta nenhuma linha. Na mesma transação reserva as linhas do precatório nas filas mensais do RPA antigo;
+    se o RPA (token A3) está com uma delas, desfaz tudo e não pega. Devolve (software, status, disponivel_em) de antes,
+    ou None."""
     with con.cursor() as cur:
         cur.execute(f"""WITH alvo AS (
                           SELECT cc.credito_id, cc.software_id, cc.status_id, cc.disponivel_em
@@ -1660,6 +1764,11 @@ def reservar(con, credito_id, lease, id_software):
                         RETURNING alvo.software_id, alvo.status_id, alvo.disponivel_em""",
                     (credito_id, TRIBUNAL_TJMA, id_software, WORKER, lease))
         antes = cur.fetchone()
+        if antes and not reservar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJMA",
+                                                WORKER):
+            con.rollback()
+            log.info(f"{credito_id}: o RPA está processando o precatório (fila mensal em andamento); fica para depois")
+            return None
     con.commit()
     return antes
 
@@ -1667,7 +1776,7 @@ def reservar(con, credito_id, lease, id_software):
 def anotar_desfazer_fila(rod, credito_id, antes):
     """Lead que era do RPA: guarda o UPDATE que o devolve ao RPA com o status de antes (desfazer_fila_<rodada>.sql)."""
     software, status, disponivel = antes
-    if software != SOFTWARE_RPA:
+    if software != SOFTWARE_RPA or not GERAR_DESFAZER:
         return
     arquivo = SAIDA / f"desfazer_fila_{rod.rodada}.sql"
     novo = not arquivo.exists()
@@ -1697,8 +1806,10 @@ def pegar(rod):
 
 
 def devolver(con, credito_id, motivo=None, intervalo=ADIAMENTO):
-    """Volta para a fila daqui a `intervalo` (erro passageiro, sem publicação); sem motivo (Ctrl+C), volta já."""
+    """Volta para a fila daqui a `intervalo` (erro passageiro, sem publicação); sem motivo (Ctrl+C), volta já. Solta
+    também a reserva nas filas mensais."""
     with con.cursor() as cur:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJMA", WORKER)
         if motivo:
             cur.execute("SELECT creditos.fila_credor_adiar(%s, %s, %s::interval, %s)",
                         (credito_id, WORKER, intervalo, motivo[:2000]))
@@ -1737,6 +1848,7 @@ class Rodada:
             cur.execute("SELECT codigo, codigo_legado FROM creditos.status_coleta")
             self.status_legado = {codigo: legado or codigo for codigo, legado in cur.fetchall()}
         self.con.commit()
+        FILAS_MENSAIS[:] = self.filas
         self.djen = Djen(self.parar, usar_proxies)
         log.info(f"{self.modo} | worker {WORKER} | software {SOFTWARE} (id {self.id_software}) | lote de {LOTE} | "
                  f"{workers} workers | lease {self.lease} | DJEN: "
@@ -1767,7 +1879,13 @@ class Rodada:
         return ordem
 
     def reordenar(self):
-        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA)."""
+        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA). Antes, solta nas filas
+        mensais as reservas de robô que ficaram sem dono (robô que caiu)."""
+        with self.con.cursor() as cur:
+            soltas = limpar_reservas_orfas(cur, self.filas, "TJMA")
+        self.con.commit()
+        if soltas:
+            log.info(f"filas mensais: {soltas} reserva(s) de robô sem dono soltas")
         self.ordem, self.posicao, self.ultima_ordem = self.ordenar(), 0, time.time()
 
     def da_thread(self):
@@ -1906,7 +2024,12 @@ def ler_argumentos():
                     help="só na simulação: ids de crédito separados por vírgula (no lugar dos primeiros da fila)")
     ap.add_argument("--proxies", action="store_true",
                     help="soma PROXY_01..05 do .env como saídas do DJEN (precisam sair pelo Brasil)")
-    return ap.parse_args()
+    ap.add_argument("--sem-desfazer", action="store_true",
+                    help="não escreve os arquivos de desfazer (como os outros tribunais do modo 5 do RPA)")
+    args = ap.parse_args()
+    global GERAR_DESFAZER
+    GERAR_DESFAZER = not args.sem_desfazer
+    return args
 
 
 def main():
