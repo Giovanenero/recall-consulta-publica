@@ -89,7 +89,7 @@ log = logging.getLogger("fetch_TJMA")
 
 TRIBUNAL_TJMA = 110
 SOFTWARE = "CONSULTA_PUBLICA_TJMA"
-GERAR_DESFAZER = True                  # False com --sem-desfazer (modo 5 do RPA_SISTEMAS): não escreve os arquivos de desfazer
+GERAR_DESFAZER = False                 # True com --com-desfazer: escreve os arquivos de desfazer (o padrão é não escrever)
 SOFTWARE_RPA = 2                       # RPA_CREDOR_V1
 WORKER = f"{socket.gethostname()}:TJMA:consulta_publica:{os.getpid()}"
 LOTE = 20                              # créditos por transação de gravação
@@ -2024,11 +2024,13 @@ def ler_argumentos():
                     help="só na simulação: ids de crédito separados por vírgula (no lugar dos primeiros da fila)")
     ap.add_argument("--proxies", action="store_true",
                     help="soma PROXY_01..05 do .env como saídas do DJEN (precisam sair pelo Brasil)")
+    ap.add_argument("--com-desfazer", action="store_true",
+                    help="escreve os arquivos de desfazer (desfazer_*.sql e backup .csv); o padrão é não escrever")
     ap.add_argument("--sem-desfazer", action="store_true",
-                    help="não escreve os arquivos de desfazer (como os outros tribunais do modo 5 do RPA)")
+                    help="não escreve os arquivos de desfazer (já é o padrão; os ciclos do modo 5 do RPA passam)")
     args = ap.parse_args()
     global GERAR_DESFAZER
-    GERAR_DESFAZER = not args.sem_desfazer
+    GERAR_DESFAZER = args.com_desfazer and not args.sem_desfazer
     return args
 
 

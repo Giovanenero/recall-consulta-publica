@@ -143,8 +143,10 @@ advogados)" no motivo.
 
 ## Saídas (`TJMT/saida/`, fora do git)
 
-`fetch_TJMT.csv` (1 linha por crédito; `_simulacao` na simulação), `fetch_credores_trocados.csv`,
-`fetch_legado_backup.csv`, `desfazer_legado_<rodada>.sql`, `desfazer_fila_<rodada>.sql` e `logs/`.
+`fetch_TJMT.csv` (1 linha por crédito; `_simulacao` na simulação), `fetch_credores_trocados.csv` e `logs/`; com
+`--com-desfazer`, também `fetch_legado_backup.csv`, `desfazer_legado_<rodada>.sql` e `desfazer_fila_<rodada>.sql`
+(desde 07/10/2026 o padrão é não escrever o desfazer; `--sem-desfazer`, que os ciclos do modo 5 passam, continua
+aceito).
 
 ## Testes (01/10/2026)
 
