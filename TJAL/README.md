@@ -14,7 +14,15 @@ python TJAL/fetch_TJAL.py --simulacao   # faz tudo e dá ROLLBACK em cada lead: 
 python TJAL/fetch_TJAL.py               # GRAVA (avisa e espera 10 s: Ctrl+C cancela)
 ```
 
-- Roda **todos** os leads do TJAL de uma vez (não há `--limite`). Uma rodada completa leva horas: o 1º grau do e-SAJ
+- **`--fila [--limite N]`** (modo 5 do RPA_SISTEMAS): só os leads em FALHA/PENDENTE que o robô não raspou nos
+  últimos 7 dias (`DIAS_FILA`), com número CNJ do TJAL que bate com o crédito, do mais prioritário e de maior valor
+  para o menor. Gravando, cada lead é **reservado** antes da raspagem: `coleta_credor` em EM_ANDAMENTO com lease do
+  processo (`consulta_publica_tjal:<máquina>:<pid>`, 3 h), sem trocar o software, e as linhas do precatório nas filas
+  mensais em `CREDOR_EM_ANDAMENTO` com a marca do robô (o RPA com token A3 e outra máquina não o pegam; lead que o
+  RPA já está processando fica de fora). No fim, ou no Ctrl+C, o lead que não virou SUCESSO volta ao status de antes.
+  Se o robô cair, o lease vence em 3 h e o banco devolve o lead como PENDENTE. A fila tem pasta de rodada própria
+  (`*_fila-gravacao`, `*_fila-simulacao`).
+- Sem `--fila`, roda **todos** os leads do TJAL de uma vez. Uma rodada completa leva horas: o 1º grau do e-SAJ
   só aceita uma consulta a cada ~1,6 s.
 - **Retomada**: a raspagem guarda um checkpoint (`_progresso.jsonl`) na pasta da execução. Se for interrompida
   (Ctrl+C, queda), rodar o mesmo comando continua de onde parou; leads que deram erro são raspados de novo. O banco só
@@ -90,9 +98,11 @@ Casos para conferência humana vão para `revisao.csv`: `CREDOR_ORGAO_PUBLICO`, 
 
 Pasta `TJAL/saida/AAAAMMDD_HHMM_<gravacao|simulacao>/`: `processos.csv`, `partes.csv`, `advogados.csv`,
 `leads_enriquecimento.csv` (escrito por último: marca a raspagem como completa), `acoes.csv`,
-`credores_trocados.csv`, `revisao.csv`, `backup_*.csv` e, na gravação, `desfazer_tabelas_antigas.sql` (devolve filas
-mensais e capa antiga ao estado anterior). **No fim da execução os CSVs e o checkpoint são apagados**; fica só o SQL
-de desfazer. O resumo (contagens por status, por ação e por fila) sai no log.
+`credores_trocados.csv`, `revisao.csv`, `backup_*.csv` e, na gravação com `--com-desfazer`,
+`desfazer_tabelas_antigas.sql` (devolve filas mensais e capa antiga ao estado anterior). **No fim da execução os CSVs e
+o checkpoint são apagados**; fica só o SQL de desfazer, quando pedido. Desde 07/10/2026 o padrão é não escrever o
+desfazer; `--sem-desfazer`, que os ciclos do modo 5 passam, continua aceito. O resumo (contagens por status, por ação
+e por fila) sai no log.
 
 ## Tecnologias
 

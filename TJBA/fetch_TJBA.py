@@ -4,7 +4,8 @@ acha e confirma o originário (DJEN + PJe 1º grau público) e grava o resultado
 
 1. Fila: o robô tem software próprio (CONSULTA_PUBLICA_TJBA) na fila creditos.coleta_credor. assumir_fila() passa
    para ele as linhas do TJBA que eram do RPA (fora de lease) e deixa PENDENTE quem não tem credor. Cada crédito é
-   reservado com fila_credor_pegar (lease) antes de raspar.
+   reservado com fila_credor_pegar (lease) antes de raspar, e na mesma transação também nas filas mensais do RPA
+   antigo (CREDOR_EM_ANDAMENTO com a marca do robô: o RPA com token A3 não o pega; se o RPA já estiver nele, adia).
 2. Candidatos a originário: o que já está ligado, a pista deixada pelo RPA (capa antiga ou CNJ achado) e a busca
    pelo nome do beneficiário no DJEN (beneficiário no polo ativo, ente no passivo, não mais novo que o precatório).
 3. Confirma cada candidato pela capa que já está no banco (credor com CPF) ou abrindo o PJe 1º grau público
@@ -79,6 +80,8 @@ if str(AQUI.parent) not in sys.path:
 
 from utils import banco  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
+from utils.legado import (limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
+                          reservar_filas_mensais, soltar_filas_mensais)
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 from utils import workers  # noqa: E402
@@ -92,6 +95,7 @@ log = logging.getLogger("fetch_TJBA")
 
 TRIBUNAL_TJBA = 105
 SOFTWARE = "CONSULTA_PUBLICA_TJBA"
+GERAR_DESFAZER = False                 # True com --com-desfazer: escreve os arquivos de desfazer (o padrão é não escrever)
 SOFTWARE_RPA = 2                       # RPA_CREDOR_V1
 WORKER_N = 1                           # número do worker nesta máquina (--worker); definir_worker() troca os 3
 WORKER = f"{socket.gethostname()}:TJBA:consulta_publica:w1:{os.getpid()}"
@@ -100,6 +104,8 @@ LEASE = f"{TETO_CREDITO // 60 + 30} minutes"          # cobre o processamento (a
 ADIAMENTO = "30 minutes"
 ADIAMENTO_CONFLITO = "5 minutes"       # deadlock com a gravação de outro worker: tenta de novo logo
 ASSUMIR_A_CADA = 30 * 60               # s entre rodadas de assumir_fila
+FILAS_MENSAIS = []                     # filas do RPA antigo com permissão de UPDATE (a Rodada preenche): reserva e status
+MAX_PULOS_RPA = 20                     # créditos seguidos que o RPA está processando (fila mensal) antes de desistir
 MAX_FALHAS_SEGUIDAS = 5                # falhas técnicas (ou de gravação) seguidas que param o robô
 PJE_INSTAVEL_PARA_PAUSAR = 3           # créditos seguidos com o PJe sem responder que pausam os workers da máquina
 PAUSAS_PJE = (10 * 60, 20 * 60, 30 * 60)   # s de cada pausa por instabilidade (a última se repete)
@@ -1310,7 +1316,7 @@ class Backup:
     def confirmar(self, credito_id, gravado):
         """Depois do COMMIT (gravado=True): escreve o SQL que desfaz o crédito e lembra as linhas tocadas. Depois do
         ROLLBACK da simulação (gravado=False) não há o que desfazer: só esquece."""
-        if gravado and self.p_sql:
+        if gravado and self.p_sql and GERAR_DESFAZER:
             novo = not self.arquivo_sql.exists()
             with open(self.arquivo_sql, "a", encoding="utf-8") as f:
                 if novo:
@@ -1484,13 +1490,17 @@ def atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk):
                                         creditos.so_digitos(numero_precatorio)) = %s
                            FOR UPDATE""", (lead["numero_norm"][:20].rjust(20, "0"), lead["numero_norm"]))
         for linha in como_dicts(cur):
-            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO":
+            reservada = reserva_de_robo(linha)          # a reserva do próprio robô é trocada pelo resultado
+            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO" and not reservada:
                 cont["fila_pulada"] += 1
                 continue
             chave = {"id_processo": linha["id_processo"], "numero_precatorio": linha["numero_precatorio"],
                      "tribunal_origem": "TJBA"}
-            bk.update(cur, fila, chave, {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead",
-                                                             "numero_originario", "ultima_atualizacao")})
+            antes = {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead", "numero_originario",
+                                           "ultima_atualizacao")}
+            if reservada:                               # o desfazer devolve a linha vazia, como antes da reserva
+                antes.update(status_coleta_lead=None, motivo_coleta_lead=None)
+            bk.update(cur, fila, chave, antes)
             cur.execute(f"""UPDATE {fila}
                                SET status_coleta_lead = %s, motivo_coleta_lead = %s,
                                    numero_originario = COALESCE(%s::text[], numero_originario),
@@ -1603,8 +1613,21 @@ def na_fila(rod, sql, params):
         log.error(f"fila: não consegui atualizar o crédito ({(str(e).splitlines() or [''])[0][:200]})")
 
 
+def soltar_reserva(rod, credito_id):
+    """Solta a reserva do crédito nas filas mensais (crédito devolvido ou em FALHA), numa transação curta própria. Se
+    falhar, só registra: limpar_reservas_orfas solta depois."""
+    try:
+        with rod.con.cursor() as cur:
+            soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJBA", WORKER)
+        rod.con.commit()
+    except psycopg2.Error as e:
+        desfazer_transacao(rod)
+        log.error(f"fila mensal: não consegui soltar a reserva ({(str(e).splitlines() or [''])[0][:200]})")
+
+
 def marcar_falha(rod, credito_id, erro):
     """FALHA na fila para o crédito que não gravou."""
+    soltar_reserva(rod, credito_id)
     na_fila(rod, """SELECT creditos.fila_credor_finalizar(p_credito_id => %s, p_worker => %s,
                        p_status => 'FALHA', p_motivo => %s, p_sistema => 'PJE', p_host => %s)""",
             (credito_id, WORKER, erro, socket.gethostname()))
@@ -1612,6 +1635,7 @@ def marcar_falha(rod, credito_id, erro):
 
 def adiar_por_conflito(rod, credito_id, motivo):
     """Crédito que perdeu um deadlock para a gravação de outro worker: volta para a fila daqui a ADIAMENTO_CONFLITO."""
+    soltar_reserva(rod, credito_id)
     na_fila(rod, "SELECT creditos.fila_credor_adiar(%s, %s, %s::interval, %s)",
             (credito_id, WORKER, ADIAMENTO_CONFLITO, motivo))
 
@@ -1714,20 +1738,34 @@ def assumir_fila(con, id_software, rodada):
 
 
 def pegar(con):
-    """Reserva o próximo crédito do TJBA na fila (lease de LEASE para este worker); None se a fila está vazia."""
-    with con.cursor() as cur:
-        cur.execute("""SELECT credito_id
-                         FROM creditos.fila_credor_pegar(p_tribunal => 'TJBA', p_worker => %s, p_quantidade => 1,
-                                                         p_lease => %s::interval, p_software => %s)""",
-                    (WORKER, LEASE, SOFTWARE))
-        linha = cur.fetchone()
-    con.commit()
-    return linha[0] if linha else None
+    """Reserva o próximo crédito do TJBA na fila (lease de LEASE para este worker) e, na mesma transação, as linhas do
+    precatório nas filas mensais do RPA antigo. Se o RPA (token A3) está com uma delas, adia o crédito (ADIAMENTO, sem
+    trocar o motivo) e tenta o próximo. None se a fila está vazia."""
+    for _ in range(MAX_PULOS_RPA):
+        with con.cursor() as cur:
+            cur.execute("""SELECT credito_id
+                             FROM creditos.fila_credor_pegar(p_tribunal => 'TJBA', p_worker => %s, p_quantidade => 1,
+                                                             p_lease => %s::interval, p_software => %s)""",
+                        (WORKER, LEASE, SOFTWARE))
+            linha = cur.fetchone()
+            if not linha:
+                con.commit()
+                return None
+            credito_id = linha[0]
+            if reservar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJBA", WORKER):
+                con.commit()
+                return credito_id
+            cur.execute("SELECT creditos.fila_credor_adiar(%s, %s, %s::interval, NULL)", (credito_id, WORKER, ADIAMENTO))
+        con.commit()
+        log.info(f"{credito_id}: o RPA está processando o precatório (fila mensal em andamento); adiado {ADIAMENTO}")
+    return None
 
 
 def devolver(con, credito_id, motivo=None):
-    """Erro passageiro: volta para a fila daqui a ADIAMENTO; sem motivo (Ctrl+C), volta já."""
+    """Erro passageiro: volta para a fila daqui a ADIAMENTO; sem motivo (Ctrl+C), volta já. Solta também a reserva nas
+    filas mensais."""
     with con.cursor() as cur:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJBA", WORKER)
         if motivo:
             cur.execute("SELECT creditos.fila_credor_adiar(%s, %s, %s::interval, %s)",
                         (credito_id, WORKER, ADIAMENTO, motivo[:2000]))
@@ -1776,6 +1814,7 @@ class Rodada:
             cur.execute("SELECT codigo, codigo_legado FROM creditos.status_coleta")
             self.status_legado = {codigo: legado or codigo for codigo, legado in cur.fetchall()}
         self.con.commit()
+        FILAS_MENSAIS[:] = self.filas
         self.djen = Djen(saida_djen(WORKER_N))
         log.info(f"{self.modo} | worker {WORKER} | software {SOFTWARE} (id {self.id_software}) | "
                  f"DJEN: {self.djen.nome} | Chrome: {PERFIL.name} | filas antigas: {', '.join(self.filas)}")
@@ -1785,7 +1824,10 @@ class Rodada:
         else:
             with self.con.cursor() as cur:
                 cur.execute("SELECT creditos.fila_credor_expirar_leases()")
+                soltas = limpar_reservas_orfas(cur, self.filas, "TJBA")
             self.con.commit()
+            if soltas:
+                log.info(f"filas mensais: {soltas} reserva(s) de robô sem dono soltas")
             if self.assume_fila:
                 self.assumir()
             else:
@@ -1798,6 +1840,11 @@ class Rodada:
         """Roda assumir_fila e anota a hora (para repetir a cada ASSUMIR_A_CADA)."""
         movidas, pendentes = assumir_fila(self.con, self.id_software, self.rodada)
         self.ultima_assumida = time.time()
+        with self.con.cursor() as cur:                  # a cada ASSUMIR_A_CADA: reservas de robô que ficaram sem dono
+            soltas = limpar_reservas_orfas(cur, self.filas, "TJBA")
+        self.con.commit()
+        if soltas:
+            log.info(f"filas mensais: {soltas} reserva(s) de robô sem dono soltas")
         log.info(f"fila assumida: {movidas} linhas do RPA passaram para o robô ({pendentes} sem credor, em PENDENTE)")
 
 
@@ -2007,7 +2054,13 @@ def ler_argumentos():
     quantos.add_argument("--worker", type=int, default=1,
                          help="roda só o worker N (1, 2, ...): perfil do Chrome, proxy do DJEN e arquivos próprios; "
                               "só o 1 assume a fila do RPA (padrão: 1)")
+    ap.add_argument("--com-desfazer", action="store_true",
+                    help="escreve os arquivos de desfazer (desfazer_*.sql e backup .csv); o padrão é não escrever")
+    ap.add_argument("--sem-desfazer", action="store_true",
+                    help="não escreve os arquivos de desfazer (já é o padrão; os ciclos do modo 5 do RPA passam)")
     args = ap.parse_args()
+    global GERAR_DESFAZER
+    GERAR_DESFAZER = args.com_desfazer and not args.sem_desfazer
     if args.worker < 1 or (args.workers is not None and args.workers < 1):
         ap.error("--worker e --workers precisam ser 1 ou mais")
     return args
@@ -2039,6 +2092,7 @@ def supervisionar(args):
         sup.warning(f"{args.workers} workers e {saidas_djen} saída(s) para o DJEN (direta + PROXY_*): do worker "
                     f"{saidas_djen + 1} em diante o DJEN sai direto e divide o limite por IP (fica mais lento)")
     extras = (["--simulacao"] if args.simulacao else []) + (["--limite", str(args.limite)] if args.limite else [])
+    extras += ["--com-desfazer"] if GERAR_DESFAZER else []
     workers.supervisionar(sup, args.workers,
                           lambda n: [sys.executable, str(Path(__file__).resolve()), "--worker", str(n), *extras],
                           PAUSA_ENTRE_WORKERS,

@@ -93,6 +93,12 @@ mesmo crédito; o resto é separado por worker:
 (o teto de 15 min por crédito + 30 min de folga para a gravação). `SQL_CREDITO` lê o lead: beneficiários (`lista_item.beneficiario_nome` e `metadata.de_beneficiario`), ente,
 valores (`valor_lista`, `valor_devido`), originários já ligados, motivos antigos do RPA e o último status.
 
+Na mesma transação, as linhas do precatório nas filas mensais do RPA antigo ficam em `CREDOR_EM_ANDAMENTO` com o
+motivo `CONSULTA_PUBLICA_RESERVA: <worker>` (`utils/legado.py`): o RPA com token A3 não pega o crédito. Se o RPA já
+estiver nele, o crédito é adiado 30 min (`fila_credor_adiar`, sem trocar o motivo). A gravação troca a marca pelo
+resultado; devolução e FALHA de gravação soltam a marca; marca sem dono (robô que caiu) é solta na partida e a cada
+30 min (`limpar_reservas_orfas`).
+
 ### 2. Candidatos a originário (`processar`)
 
 - Nomes a buscar: o beneficiário da lista sem aposto, "REP. POR", "E OUTROS"; espólio com inventariante vira dois
@@ -229,8 +235,10 @@ fontes, candidatos, partes e credores antes/depois; `credito_fonte.metadata`) e 
 ```
 
 Credor que sai de um crédito vira `WARNING` no log. Em disco, só o que serve para desfazer, e só na execução real
-(a simulação dá ROLLBACK e não grava arquivo): `desfazer_legado_<rodada>.sql` (tabelas antigas, pode rodar em qualquer
-ordem) e `desfazer_fila_<rodada>.sql` (a tomada da fila do RPA pelo worker 1). Mais `logs/` e `worker_<N>.lock`.
+com `--com-desfazer` (a simulação dá ROLLBACK e não grava arquivo): `desfazer_legado_<rodada>.sql` (tabelas antigas,
+pode rodar em qualquer ordem) e `desfazer_fila_<rodada>.sql` (a tomada da fila do RPA pelo worker 1). Mais `logs/` e
+`worker_<N>.lock`. Desde 07/10/2026 o padrão é não escrever o desfazer; `--sem-desfazer`, que os ciclos do modo 5
+passam, continua aceito.
 
 ## Tecnologias
 

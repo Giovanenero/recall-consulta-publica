@@ -11,10 +11,20 @@ fetch_TJAL.py - enriquece os leads do TJAL pela consulta pública (substitui o m
    (fica só o desfazer_tabelas_antigas.sql da gravação).
 
 Uso:
-    python fetch_TJAL.py --simulacao    # faz tudo e desfaz no banco (ROLLBACK): só mostra o resumo
-    python fetch_TJAL.py                # faz tudo e GRAVA no banco
+    python fetch_TJAL.py --simulacao                # todos os leads; desfaz no banco (ROLLBACK): só mostra o resumo
+    python fetch_TJAL.py                            # todos os leads; GRAVA no banco
+    python fetch_TJAL.py --fila --limite 500        # fila (modo 5 do RPA_SISTEMAS): grava até 500 leads da fila
+    python fetch_TJAL.py --fila --limite 20 --simulacao
 
-Se a raspagem for interrompida, os arquivos ficam e rodar o mesmo comando de novo continua de onde parou.
+--fila: só os leads em FALHA/PENDENTE (os únicos cujo status o robô melhora) que ele não raspou nos últimos DIAS_FILA
+dias, com número CNJ do TJAL que bate com o crédito, do mais prioritário e de maior valor para o menor. Gravando, cada
+lead é reservado antes da raspagem (coleta_credor em EM_ANDAMENTO com lease deste processo, sem trocar o software, e
+as linhas do precatório nas filas mensais em CREDOR_EM_ANDAMENTO com a marca do robô): o RPA com token A3 e outra
+máquina não o pegam. No fim (ou no Ctrl+C) o lead que não virou SUCESSO volta ao status de antes. Se o robô cair, o
+lease vence em LEASE_FILA e o banco devolve o lead como PENDENTE.
+
+Se a raspagem for interrompida, os arquivos ficam e rodar o mesmo comando de novo continua de onde parou (a fila tem
+pasta própria, *_fila-<modo>: nunca retoma nem apaga a de uma execução com todos os leads).
 O valor do precatório é ignorado.
 
 Log: terminal e TJAL/saida/logs/fetch_TJAL_AAAAMMDD.log, no formato padrão (utils/log.py).
@@ -22,7 +32,9 @@ Log: terminal e TJAL/saida/logs/fetch_TJAL_AAAAMMDD.log, no formato padrão (uti
 import argparse
 import json
 import logging
+import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -44,6 +56,7 @@ if str(AQUI.parent) not in sys.path:
 
 from utils.arquivos import gravar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, conectar, filas_antigas, id_do_software, partes_do_banco  # noqa: E402
+from utils.legado import MARCA_RESERVA, reservar_filas_mensais, soltar_filas_mensais  # noqa: E402
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
@@ -54,8 +67,11 @@ log = logging.getLogger("fetch_TJAL")
 
 TRIBUNAL_TJAL = 102
 SOFTWARE = "CONSULTA_PUBLICA_TJAL"
-WORKER = "consulta_publica_tjal"
+GERAR_DESFAZER = False                 # True com --com-desfazer: escreve os arquivos de desfazer (o padrão é não escrever)
+WORKER = "consulta_publica_tjal"                      # com --fila ganha a máquina e o processo (é o dono do lease)
 FILA_ANTIGA_DESDE = "processos_unificados_2026_08"    # filas do robô atualizadas: esta e as mais novas
+DIAS_FILA = 7                                         # --fila: lead raspado há menos que isso não volta
+LEASE_FILA = "3 hours"                                # --fila: reserva de cada lead (raspagem + gravação da rodada)
 STATUS_LEGADO = {"SUCESSO_PROCESSO_CREDITO": "CREDOR_SUCESSO_atraves_precatorio",
                  "SUCESSO_PROCESSO_ORIGINARIO": "CREDOR_SUCESSO_atraves_originario",
                  "SUCESSO_API_TERCEIRO": "CREDOR_SUCESSO_API_TERCEIRO"}
@@ -249,16 +265,108 @@ where c.tribunal_id = %(tribunal)s
 order by c.id
 """
 
+# --fila (modo 5 do RPA_SISTEMAS): FALHA/PENDENTE (os únicos que melhorar_status muda) fora de lease, que o robô não
+# raspou nos últimos DIAS_FILA dias (credito_fonte.metadata.raspado_em, gravado por registrar_fonte). Fora também o
+# que nunca ganharia raspado_em: número que não é CNJ do TJAL (processar_lead não abre capa) ou que não bate com o
+# crédito (registrar_fonte pula) — senão a fila nunca esvazia. A contagem do modo 5 (main.py, _SQL_MODO5["TJAL"] no
+# RPA_SISTEMAS) usa o MESMO filtro.
+SQL_LEADS_FILA = SQL_LEADS.replace("order by c.id", """  and sc.codigo in ('PENDENTE', 'FALHA')
+  and cc.disponivel_em <= now()
+  and c.tipo_credito_id = 1
+  and c.numero_exibicao ~ '[0-9]{7}-[0-9]{2}[.][0-9]{4}[.][0-9][.][0-9]{2}[.][0-9]{4}'
+  and substr(c.numero_norm, 14, 3) = '802'
+  and c.numero_norm = coalesce(creditos.cnj_normalizar(c.numero_exibicao), creditos.so_digitos(c.numero_exibicao))
+  and not exists (select 1 from creditos.credito_fonte f
+                   where f.credito_id = c.id
+                     and f.software_id = (select id from creditos.software where codigo = %(software)s)
+                     and f.metadata->>'raspado_em' >= to_char((now() at time zone 'America/Sao_Paulo')
+                                                              - %(dias)s * interval '1 day', 'YYYY-MM-DD HH24:MI:SS'))
+order by cc.prioridade, cc.valor_referencia desc nulls last, c.id
+limit %(limite)s""")
+assert SQL_LEADS_FILA != SQL_LEADS
 
-def carregar_leads():
-    """Todos os leads do TJAL na lista, como lista de dicts."""
+
+def carregar_leads(fila=False, limite=None):
+    """Leads do TJAL na lista (todos, ou só os da fila, até `limite`), como lista de dicts."""
     con = conectar("fetch_TJAL")
     try:
         with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(SQL_LEADS, {"tribunal": TRIBUNAL_TJAL})
+            cur.execute(SQL_LEADS_FILA if fila else SQL_LEADS,
+                        {"tribunal": TRIBUNAL_TJAL, "software": SOFTWARE, "dias": DIAS_FILA, "limite": limite or None})
             return [dict(r) for r in cur.fetchall()]
     finally:
         con.close()
+
+
+def reservar_leads(leads):
+    """--fila gravando: reserva cada lead antes da raspagem (coleta_credor em EM_ANDAMENTO com lease deste processo,
+    sem trocar o software; e as linhas do precatório nas filas mensais). Lead que outro processo pegou, ou que o RPA
+    está processando na fila mensal, fica de fora. Devolve (leads reservados, {credito_id: status_id de antes}, filas)."""
+    con = conectar("fetch_TJAL", escrita=True)
+    reservados, originais, pulados = [], {}, Counter()
+    try:
+        with con.cursor() as cur:
+            filas = filas_antigas(cur, FILA_ANTIGA_DESDE)[0]
+            for lead in leads:
+                cur.execute("SAVEPOINT reserva")
+                cur.execute("""WITH alvo AS (
+                                 SELECT cc.credito_id, cc.status_id
+                                   FROM creditos.coleta_credor cc
+                                   JOIN creditos.status_coleta sc ON sc.id = cc.status_id
+                                  WHERE cc.credito_id = %s AND sc.codigo IN ('PENDENTE', 'FALHA')
+                                    AND cc.lease_worker IS NULL AND cc.disponivel_em <= now()
+                                    FOR UPDATE OF cc SKIP LOCKED)
+                               UPDATE creditos.coleta_credor cc
+                                  SET status_id = 2, lease_worker = %s, lease_ate = now() + %s::interval,
+                                      reservado_em = now(), updated_at = now()
+                                 FROM alvo
+                                WHERE cc.credito_id = alvo.credito_id
+                               RETURNING alvo.status_id""", (lead["credito_id"], WORKER, LEASE_FILA))
+                linha = cur.fetchone()
+                if not linha:
+                    cur.execute("RELEASE SAVEPOINT reserva")
+                    pulados["outro processo"] += 1
+                    continue
+                if not reservar_filas_mensais(cur, filas, lead["numero_norm"] or "", "TJAL", WORKER):
+                    cur.execute("ROLLBACK TO SAVEPOINT reserva")
+                    pulados["RPA processando na fila mensal"] += 1
+                    continue
+                cur.execute("RELEASE SAVEPOINT reserva")
+                originais[lead["credito_id"]] = linha[0]
+                reservados.append(lead)
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    log.info(f"fila: {len(reservados)} lead(s) reservados por {WORKER} (lease {LEASE_FILA})"
+             + (" | fora: " + ", ".join(f"{k}: {v}" for k, v in pulados.items()) if pulados else ""))
+    return reservados, originais, filas
+
+
+def soltar_leads(leads, originais, filas):
+    """Fim da rodada --fila (também no Ctrl+C ou erro): o lead que não virou SUCESSO (o lease ainda é deste processo)
+    volta ao status de antes, FALHA ou PENDENTE, e as linhas dele nas filas mensais voltam a vazio."""
+    if not originais:
+        return
+    con = conectar("fetch_TJAL", escrita=True)
+    try:
+        with con.cursor() as cur:
+            cur.execute("""UPDATE creditos.coleta_credor cc
+                              SET status_id = v.status_id, lease_worker = NULL, lease_ate = NULL,
+                                  reservado_em = NULL, updated_at = now()
+                             FROM unnest(%s::bigint[], %s::smallint[]) AS v(credito_id, status_id)
+                            WHERE cc.credito_id = v.credito_id AND cc.status_id = 2 AND cc.lease_worker = %s""",
+                        (list(originais), list(originais.values()), WORKER))
+            devolvidos = cur.rowcount
+            soltas = sum(soltar_filas_mensais(cur, filas, lead["numero_norm"] or "", "TJAL", WORKER)
+                         for lead in leads if lead["credito_id"] in originais)
+        con.commit()
+    finally:
+        con.close()
+    log.info(f"fila: {devolvidos} lead(s) voltaram ao status de antes (sem SUCESSO nesta rodada); "
+             f"{soltas} linha(s) das filas mensais soltas")
 
 
 # =============================================================================== SAPRE (API pública)
@@ -1092,9 +1200,12 @@ def atualizar_fila_antiga(cur, r, fila):
     requerentes_api = json.dumps([{"nome": credor_api, "tipo": "polo_ativo"}], ensure_ascii=False)
     backup, em_andamento = [], 0
     for id_processo, numero_linha, req_antes, status_antes, motivo_antes, atualizado_antes in linhas:
-        if status_antes == "CREDOR_EM_ANDAMENTO":         # o robô está trabalhando nesta linha
+        reservada = status_antes == "CREDOR_EM_ANDAMENTO" and (motivo_antes or "").startswith(MARCA_RESERVA)
+        if status_antes == "CREDOR_EM_ANDAMENTO" and not reservada:   # o RPA está trabalhando nesta linha
             em_andamento += 1
             continue
+        if reservada:              # reserva deste robô (--fila): antes dela a linha estava vazia, e é isso que vale
+            status_antes = motivo_antes = None
         status_depois, motivo_depois = status_antes, motivo_antes
         if status_novo and (status_antes is None or status_antes.startswith("CREDOR_FALHA")):
             status_depois, motivo_depois = status_novo, f"{WORKER} cnj={precatorio_cnj(r)}"
@@ -1387,10 +1498,11 @@ def atualizar_banco(pasta, resultados, gravar):
     gravar_csv(pasta / "acoes.csv", acoes)
     gravar_csv(pasta / "credores_trocados.csv", trocas)
     gravar_csv(pasta / "revisao.csv", sorted(revisao, key=lambda x: (x["tipo"], x["numero_precatorio"] or "")))
-    gravar_csv(pasta / "backup_fila_antiga.csv", backup_fila)
-    if capa_antiga:
+    if GERAR_DESFAZER:
+        gravar_csv(pasta / "backup_fila_antiga.csv", backup_fila)
+    if capa_antiga and GERAR_DESFAZER:
         gravar_csv(pasta / "backup_capa_antiga.csv", backup_capa)
-    if gravar and (backup_fila or backup_capa):
+    if gravar and GERAR_DESFAZER and (backup_fila or backup_capa):
         (pasta / "desfazer_tabelas_antigas.sql").write_text(sql_para_desfazer(backup_fila, backup_capa),
                                                             encoding="utf-8")
 
@@ -1447,19 +1559,38 @@ def executar(leads, gravar, pasta):
 
 
 def ler_argumentos():
-    """--simulacao: faz tudo, mas desfaz a atualização do banco."""
+    """--simulacao: faz tudo, mas desfaz a atualização do banco. --fila [--limite N]: só os leads da fila."""
     ap = argparse.ArgumentParser(description="Enriquece os leads do TJAL pela consulta pública e atualiza o banco.")
     ap.add_argument("--simulacao", action="store_true",
                     help="faz tudo, mas desfaz a atualização do banco (ROLLBACK): só mostra o resumo")
-    return ap.parse_args()
+    ap.add_argument("--fila", action="store_true",
+                    help=f"só FALHA/PENDENTE não raspados há {DIAS_FILA} dias, reservados durante a rodada "
+                         "(modo 5 do RPA_SISTEMAS)")
+    ap.add_argument("--limite", type=int, default=None,
+                    help="com --fila: no máximo N leads nesta rodada (0 = a fila inteira)")
+    ap.add_argument("--com-desfazer", action="store_true",
+                    help="escreve os arquivos de desfazer (desfazer_*.sql e backup .csv); o padrão é não escrever")
+    ap.add_argument("--sem-desfazer", action="store_true",
+                    help="não escreve os arquivos de desfazer (já é o padrão; os ciclos do modo 5 do RPA passam)")
+    args = ap.parse_args()
+    global GERAR_DESFAZER
+    GERAR_DESFAZER = args.com_desfazer and not args.sem_desfazer
+    if args.limite is not None and not args.fila:
+        ap.error("--limite só vale com --fila")
+    if args.limite is not None and args.limite < 0:
+        ap.error("--limite precisa ser 0 ou mais")
+    return args
 
 
 def main():
     """Carrega os leads, raspa (retomando a execução interrompida do mesmo modo) e atualiza o banco."""
+    global WORKER
     args = ler_argumentos()
     configurar_log(__file__, SAIDA / "logs")
     gravar = not args.simulacao
-    pasta = pasta_da_execucao("gravacao" if gravar else "simulacao")
+    if args.fila:
+        WORKER = f"consulta_publica_tjal:{socket.gethostname()}:{os.getpid()}"   # dono do lease desta rodada
+    pasta = pasta_da_execucao(("fila-" if args.fila else "") + ("gravacao" if gravar else "simulacao"))
 
     if gravar:
         log.warning("ATENÇÃO: esta execução vai GRAVAR no banco (schema creditos, filas do robô e capa antiga). "
@@ -1469,11 +1600,27 @@ def main():
         log.info(f"Retomando a raspagem interrompida em {pasta.name}")
 
     t0 = time.time()
-    leads = carregar_leads()
-    log.info(f"{len(leads)} leads do TJAL na lista (lidos em {time.time() - t0:.1f}s)")
-    if not executar(leads, gravar, pasta):
-        log.warning("Raspagem interrompida: o banco NÃO foi atualizado. "
-                    "Rode o mesmo comando de novo para continuar de onde parou.")
+    leads = carregar_leads(args.fila, args.limite)
+    if args.fila:
+        log.info(f"{len(leads)} leads do TJAL na fila (FALHA/PENDENTE não raspados há {DIAS_FILA} dias"
+                 f"{f', até {args.limite}' if args.limite else ''}; lidos em {time.time() - t0:.1f}s)")
+        if not leads:
+            log.info("Fila vazia: nada a fazer.")
+            return
+    else:
+        log.info(f"{len(leads)} leads do TJAL na lista (lidos em {time.time() - t0:.1f}s)")
+    originais, filas = {}, []
+    try:
+        if args.fila and gravar:
+            leads, originais, filas = reservar_leads(leads)
+            if not leads:
+                log.info("Nenhum lead da fila pôde ser reservado agora: nada a fazer.")
+                return
+        if not executar(leads, gravar, pasta):
+            log.warning("Raspagem interrompida: o banco NÃO foi atualizado. "
+                        "Rode o mesmo comando de novo para continuar de onde parou.")
+    finally:
+        soltar_leads(leads, originais, filas)
 
 
 if __name__ == "__main__":
