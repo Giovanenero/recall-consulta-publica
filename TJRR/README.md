@@ -22,7 +22,16 @@ python TJRR/fetch_TJRR.py --workers 3 --ritmo 2               # padrão: 3 threa
 python TJRR/captcha_TJRR.py muraki                            # só testa o captcha (muraki ou projudi)
 ```
 
-- **`.env`:** `PG_*` e `LOTE_GRAVACAO_TJRR` (créditos por transação, inteiro maior que zero).
+- **`.env`:** `PG_*`. O lote de gravação (créditos por transação) é a constante `LOTE` no início do robô (20).
+- **Reserva (modo 5 do RPA_SISTEMAS, 07/10/2026):** cada crédito pego fica reservado em `coleta_credor` (lease) e, na
+  mesma transação, nas filas mensais do RPA antigo (`CREDOR_EM_ANDAMENTO` com o motivo
+  `CONSULTA_PUBLICA_RESERVA: <worker>`, `utils/legado.py`): o RPA com token não pega o lead. Se o RPA já está com o
+  precatório numa fila mensal, o robô não o pega. A gravação troca a marca pelo resultado; devolução e falha a soltam;
+  reserva sem dono é solta na partida e a cada 30 min.
+- **Arquivos de desfazer:** só com `--com-desfazer`; o padrão é não escrever (`--sem-desfazer`, que os ciclos do modo
+  5 passam, continua aceito).
+- **Conexão parada:** o Postgres derruba sessão parada há mais de 15 min; depois da espera pelos adiados o robô abre
+  conexões novas, e a leitura do crédito tenta de novo uma vez com conexão nova.
 - **Chrome:** o robô abre o Chrome instalado (perfis `TJRR/.chrome-profile-muraki-tjrr` e
   `.chrome-profile-projudi-tjrr`, fora do git) só para resolver os captchas; as consultas vão por HTTP.
 - **Rodar até acabar a carga:** com a fila vazia, espera os créditos adiados por erro passageiro (30 min) e continua.
@@ -127,9 +136,9 @@ ligado, só o credor); `creditos.processo.metadata.capa_pje` com `fonte: projudi
 
 ## Saídas (`TJRR/saida/`, fora do git)
 
-`fetch_TJRR.csv` (1 linha por crédito), `fetch_credores_trocados.csv`, `fetch_legado_backup.csv`,
-`desfazer_legado_*.sql`, `desfazer_fila_*.sql` (devolve ao RPA os leads que o robô pegou); na simulação, os mesmos
-nomes com `_simulacao`.
+`fetch_TJRR.csv` (1 linha por crédito) e `fetch_credores_trocados.csv`; com `--com-desfazer`, também
+`fetch_legado_backup.csv`, `desfazer_legado_*.sql` e `desfazer_fila_*.sql` (devolve ao RPA os leads que o robô
+pegou); na simulação, os mesmos nomes com `_simulacao`.
 
 ## Banco (02/10/2026)
 

@@ -110,6 +110,7 @@ def main():
     ap = argparse.ArgumentParser(description="Volta para FALHA os créditos do TJRR gravados com ente público credor.")
     ap.add_argument("--aplicar", action="store_true", help="grava (COMMIT); sem isso, só mostra (ROLLBACK)")
     args = ap.parse_args()
+    F.GERAR_DESFAZER = True                 # correção manual: o desfazer é sempre escrito (o robô não escreve por padrão)
     rodada = datetime.now().strftime("%Y%m%d_%H%M%S")
     sql = F.SAIDA / f"desfazer_orgao_publico_{rodada}.sql"
     bk = F.Backup(sql, F.SAIDA / "fetch_legado_backup.csv", rodada, "CORRECAO" if args.aplicar else "CORRECAO_TESTE")

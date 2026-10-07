@@ -1,8 +1,10 @@
 """
 fetch_TJRR.py - credor dos precatórios do TJRR pelas fontes públicas, de ponta a ponta, sem login: lê o banco, acha o
 credor (SGP + Murakî + Projudi + DJEN), confirma o originário e grava no banco em lotes de LOTE créditos
-(LOTE_GRAVACAO_TJRR no .env). No lugar do modo credor do RPA_SISTEMAS, que entra no Projudi com SSO+2FA e não abre o
-precatório (é sigiloso: 988 SEGREDO_DE_JUSTICA e 552 PROCESSO_NAO_ENCONTRADO nas tentativas do RPA).
+(constante abaixo). No lugar do modo credor do RPA_SISTEMAS, que entra no Projudi com SSO+2FA e não abre o
+precatório (é sigiloso: 988 SEGREDO_DE_JUSTICA e 552 PROCESSO_NAO_ENCONTRADO nas tentativas do RPA). Cada crédito é
+reservado com lease, também nas filas mensais do RPA antigo (CREDOR_EM_ANDAMENTO com a marca do robô: o RPA não o
+pega), e só nessa hora passa do RPA para o software próprio.
 
 No TJRR o número do crédito é o processo do PRÓPRIO precatório no Projudi (Núcleo de Precatórios, sigiloso), não o
 originário. A lista traz o ofício (Autos), o ID SGP e a vara de origem; o originário não vem em lugar nenhum.
@@ -42,8 +44,8 @@ Gravação (igual ao TJMT): lote numa transação, cada crédito no seu SAVEPOIN
 honorários como ADVOGADO, capa recortada do originário (só o credor, o polo passivo e os advogados; ação coletiva sem
 advogados), metadata (registrar_credito), capa antiga e filas mensais (legado) e o status (fila_credor_finalizar).
 
-Saídas em TJRR/saida: fetch_TJRR.csv (1 linha por crédito), fetch_credores_trocados.csv, fetch_legado_backup.csv,
-desfazer_legado_*.sql e desfazer_fila_*.sql.
+Saídas em TJRR/saida: fetch_TJRR.csv (1 linha por crédito) e fetch_credores_trocados.csv; com --com-desfazer,
+também fetch_legado_backup.csv, desfazer_legado_*.sql e desfazer_fila_*.sql (o padrão é não escrever o desfazer).
 
 Uso:
     python fetch_TJRR.py --simulacao            # 20 créditos: faz tudo e desfaz no banco (ROLLBACK); não mexe na fila
@@ -84,29 +86,24 @@ import captcha_TJRR as captcha  # noqa: E402
 from utils import banco  # noqa: E402
 from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
+from utils.legado import (limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
+                          reservar_filas_mensais, soltar_filas_mensais)
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
 # =============================================================================== configuração
 
 SAIDA = AQUI / "saida"
-load_dotenv(AQUI.parent / ".env")      # PG_* e LOTE_GRAVACAO_TJRR
+load_dotenv(AQUI.parent / ".env")      # PG_*
 log = logging.getLogger("fetch_TJRR")
-
-
-def lote_do_env():
-    """Créditos por transação de gravação, de LOTE_GRAVACAO_TJRR no .env (inteiro maior que zero)."""
-    valor = os.environ.get("LOTE_GRAVACAO_TJRR", "").strip()
-    if not valor.isdigit() or int(valor) < 1:
-        raise SystemExit(f"LOTE_GRAVACAO_TJRR no .env precisa ser um inteiro maior que zero (veio {valor!r}).")
-    return int(valor)
-
 
 TRIBUNAL_TJRR = 123
 SOFTWARE = "CONSULTA_PUBLICA_TJRR"
 SOFTWARE_RPA = 2                       # RPA_CREDOR_V1
 WORKER = f"{socket.gethostname()}:TJRR:consulta_publica:{os.getpid()}"
-LOTE = lote_do_env()                   # créditos por transação de gravação
+GERAR_DESFAZER = False                 # True com --com-desfazer: escreve os arquivos de desfazer (o padrão é não escrever)
+LOTE = 20                              # créditos por transação de gravação
+FILAS_MENSAIS = []                     # filas do RPA antigo com permissão de UPDATE (a Rodada preenche): reserva e status
 WORKERS = 3                            # workers (threads deste processo) raspando ao mesmo tempo (--workers)
 TETO_CREDITO = 8 * 60                  # s por crédito; passou disso, volta para a fila
 ADIAMENTO = "30 minutes"               # erro passageiro
@@ -1238,8 +1235,8 @@ class Backup:
 
     def confirmar_lote(self, manter):
         """Depois do COMMIT (ou do ROLLBACK da simulação): escreve o SQL e o CSV de cada crédito do lote;
-        manter=False (simulação) não lembra as linhas tocadas."""
-        for credito_id, sql, linhas in self.l_creditos:
+        manter=False (simulação) não lembra as linhas tocadas. Sem --com-desfazer não escreve nada."""
+        for credito_id, sql, linhas in (self.l_creditos if GERAR_DESFAZER else []):
             novo = not self.arquivo_sql.exists()
             with open(self.arquivo_sql, "a", encoding="utf-8") as f:
                 if novo:
@@ -1460,15 +1457,21 @@ def atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk):
                           FROM {fila}
                          WHERE lpad(regexp_replace(numero_precatorio, '[^0-9]', '', 'g'), 20, '0') = %s
                            AND deleted = false AND numero_precatorio IS NOT NULL AND tribunal_origem = 'TJRR'
-                           FOR UPDATE""", (lead["numero_norm"][:20].rjust(20, "0"),))
+                           AND COALESCE(creditos.cnj_normalizar(numero_precatorio),
+                                        creditos.so_digitos(numero_precatorio)) = %s
+                           FOR UPDATE""", (lead["numero_norm"][:20].rjust(20, "0"), lead["numero_norm"]))
         for linha in como_dicts(cur):
-            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO":
+            reservada = reserva_de_robo(linha)
+            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO" and not reservada:
                 cont["fila_pulada"] += 1
                 continue
             chave = {"id_processo": linha["id_processo"], "numero_precatorio": linha["numero_precatorio"],
                      "tribunal_origem": "TJRR"}
-            bk.update(cur, fila, chave, {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead",
-                                                             "numero_originario", "ultima_atualizacao")})
+            antes = {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead", "numero_originario",
+                                           "ultima_atualizacao")}
+            if reservada:
+                antes.update(status_coleta_lead=None, motivo_coleta_lead=None)
+            bk.update(cur, fila, chave, antes)
             cur.execute(f"""UPDATE {fila}
                                SET status_coleta_lead = %s, motivo_coleta_lead = %s,
                                    numero_originario = COALESCE(%s::text[], numero_originario),
@@ -1628,6 +1631,7 @@ def marcar_falha(cur, credito_id, erro):
     falhar, o lote segue)."""
     cur.execute("SAVEPOINT falha")
     try:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJRR", WORKER)
         cur.execute("""SELECT creditos.fila_credor_finalizar(p_credito_id => %s, p_worker => %s,
                           p_status => 'FALHA', p_motivo => %s, p_sistema => 'PROJUDI', p_host => %s)""",
                     (credito_id, WORKER, erro, socket.gethostname()))
@@ -1748,7 +1752,8 @@ def descarregar(rod, pendentes):
 
 def reservar(con, credito_id, lease, id_software):
     """Reserva UM crédito (lease para este worker) se ele ainda é pegável, passando-o para o software do robô nesse
-    momento. UPDATE atômico: se outra instância já o pegou, não afeta nenhuma linha.
+    momento. UPDATE atômico: se outra instância já o pegou, não afeta nenhuma linha. Na mesma transação reserva as
+    linhas do precatório nas filas mensais do RPA antigo; se o RPA (token) está com uma delas, desfaz tudo e não pega.
     Devolve (software, status, disponivel_em) de antes, ou None."""
     with con.cursor() as cur:
         cur.execute(f"""WITH alvo AS (
@@ -1766,6 +1771,11 @@ def reservar(con, credito_id, lease, id_software):
                         RETURNING alvo.software_id, alvo.status_id, alvo.disponivel_em""",
                     (credito_id, TRIBUNAL_TJRR, id_software, WORKER, lease))
         antes = cur.fetchone()
+        if antes and not reservar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJRR",
+                                                WORKER):
+            con.rollback()
+            log.info(f"{credito_id}: o RPA está processando o precatório (fila mensal em andamento); fica para depois")
+            return None
     con.commit()
     return antes
 
@@ -1773,7 +1783,7 @@ def reservar(con, credito_id, lease, id_software):
 def anotar_desfazer_fila(rod, credito_id, antes):
     """Lead que era do RPA: guarda o UPDATE que o devolve ao RPA com o status de antes (desfazer_fila_<rodada>.sql)."""
     software, status, disponivel = antes
-    if software != SOFTWARE_RPA:
+    if software != SOFTWARE_RPA or not GERAR_DESFAZER:
         return
     arquivo = SAIDA / f"desfazer_fila_{rod.rodada}.sql"
     novo = not arquivo.exists()
@@ -1805,6 +1815,7 @@ def pegar(rod):
 def devolver(con, credito_id, motivo=None, intervalo=ADIAMENTO):
     """Volta para a fila daqui a `intervalo` (erro passageiro); sem motivo (Ctrl+C), volta já."""
     with con.cursor() as cur:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJRR", WORKER)
         if motivo:
             cur.execute("SELECT creditos.fila_credor_adiar(%s, %s, %s::interval, %s)",
                         (credito_id, WORKER, intervalo, motivo[:2000]))
@@ -1842,6 +1853,7 @@ class Rodada:
             cur.execute("SELECT codigo, codigo_legado FROM creditos.status_coleta")
             self.status_legado = {codigo: legado or codigo for codigo, legado in cur.fetchall()}
         self.con.commit()
+        FILAS_MENSAIS[:] = self.filas
         self.servico = captcha.ServicoCaptcha(self.parar)
         sgp = Sgp(self.parar)
         sgp.carregar_pagos()
@@ -1873,7 +1885,13 @@ class Rodada:
         return ordem
 
     def reordenar(self):
-        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA)."""
+        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA). Antes, solta nas filas
+        mensais as reservas de robô que ficaram sem dono (robô que caiu)."""
+        with self.con.cursor() as cur:
+            soltas = limpar_reservas_orfas(cur, self.filas, "TJRR")
+        self.con.commit()
+        if soltas:
+            log.info(f"filas mensais: {soltas} reserva(s) de robô sem dono soltas")
         self.ordem, self.posicao, self.ultima_ordem = self.ordenar(), 0, time.time()
 
     def reconectar(self):
@@ -1883,6 +1901,18 @@ class Rodada:
         except Exception:
             pass
         self.con = conectar(escrita=True)
+
+    def renovar_conexoes(self):
+        """Depois de uma espera longa: o Postgres derruba sessão parada há mais de 15 min (idle_session_timeout).
+        Abre a conexão de escrita de novo e fecha as de leitura das threads (cada uma reabre a sua na próxima leitura)."""
+        self.reconectar()
+        with self.trava:
+            for con in self.conexoes:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            self.conexoes.clear()
 
     def conexao_da_thread(self):
         """Conexão de leitura da thread que chama; criada na 1ª vez (e de novo se a anterior caiu)."""
@@ -1947,6 +1977,7 @@ def esperar_adiados(rod):
     log.info(f"fila vazia, mas há crédito adiado que vence em {espera / 60:.0f} min: esperando para continuar")
     if rod.parar.wait(espera):
         return False
+    rod.renovar_conexoes()
     rod.fila_vazia = False
     rod.reordenar()
     return True
@@ -1959,8 +1990,13 @@ def processar_credito(rod, credito_id, n):
     linha = {"processado_em": datetime.now().isoformat(timespec="seconds"), "modo": rod.modo, "credito_id": credito_id}
     lead = None
     try:
-        with rod.conexao_da_thread().cursor() as cur:
-            lead = ler_credito(cur, credito_id)
+        try:
+            with rod.conexao_da_thread().cursor() as cur:
+                lead = ler_credito(cur, credito_id)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            rod.local.con = None                        # conexão de leitura parada demais e derrubada: abre outra
+            with rod.conexao_da_thread().cursor() as cur:
+                lead = ler_credito(cur, credito_id)
         linha.update(precatorio=lead["precatorio"], faixa=lead["faixa"], ente=lead["ente"],
                      situacao=lead["situacao"], ultimo_status=lead["ultimo_status"])
         r = processar(lead, rod.fontes, inicio)
@@ -2037,7 +2073,7 @@ def encerrar(rod, pendentes, inicio):
 
 
 def ler_argumentos():
-    """--simulacao, --limite N, --workers N, --ritmo N e --creditos."""
+    """--simulacao, --limite N, --workers N, --ritmo N, --creditos, --com-desfazer e --sem-desfazer."""
     ap = argparse.ArgumentParser(description="Credor do TJRR pelas fontes públicas (SGP, Murakî, Projudi, DJEN), "
                                              f"gravado no banco em lotes de {LOTE}.")
     ap.add_argument("--simulacao", action="store_true",
@@ -2049,7 +2085,14 @@ def ler_argumentos():
                     help=f"teto de req/s no Projudi (padrão {RITMO_PROJUDI})")
     ap.add_argument("--creditos", default="",
                     help="só na simulação: ids de crédito separados por vírgula (no lugar dos primeiros da fila)")
-    return ap.parse_args()
+    ap.add_argument("--com-desfazer", action="store_true",
+                    help="escreve os arquivos de desfazer (desfazer_*.sql e backup .csv); o padrão é não escrever")
+    ap.add_argument("--sem-desfazer", action="store_true",
+                    help="não escreve os arquivos de desfazer (já é o padrão; os ciclos do modo 5 do RPA passam)")
+    args = ap.parse_args()
+    global GERAR_DESFAZER
+    GERAR_DESFAZER = args.com_desfazer and not args.sem_desfazer
+    return args
 
 
 def executar(args, creditos):

@@ -22,7 +22,15 @@ python TJDF/fetch_TJDF.py --faixa INICIAIS           # só os de 2022 em diante 
 python TJDF/fetch_TJDF.py --workers 6 --ritmo 4      # padrão: 6 threads, até 4 req/s ao PJe
 ```
 
-- **`.env`:** `PG_*` e `LOTE_GRAVACAO_TJDF` (créditos por transação, inteiro maior que zero).
+- **`.env`:** `PG_*`. O lote de gravação (créditos por transação) é a constante `LOTE` no início do robô (20).
+- **Reserva (modo 5 do RPA_SISTEMAS, 07/10/2026):** cada crédito pego fica reservado em `coleta_credor` (lease) e,
+  como nos outros robôs do modo 5, nas filas mensais do RPA antigo (`utils/legado.py`). Hoje o TJDFT não tem linha
+  nessas filas (o legado dele é a tabela antiga `processos_unificados`), então essa reserva só vale se ele entrar
+  nelas. Reserva sem dono é solta na partida e a cada 30 min.
+- **Arquivos de desfazer:** só com `--com-desfazer`; o padrão é não escrever (`--sem-desfazer`, que os ciclos do modo
+  5 passam, continua aceito).
+- **Conexão parada:** o Postgres derruba sessão parada há mais de 15 min; depois da espera pelos adiados o robô abre
+  conexões novas, e a leitura do crédito tenta de novo uma vez com conexão nova.
 - **Carga (`carregar_TJDF.py`):** decisão do usuário de 05/10/2026. Para cada precatório da tabela antiga (número de
   20 dígitos com `8.07`; os de outro tribunal ficam num CSV), chama `creditos.registrar_credito` com o software
   `CONSULTA_PUBLICA_TJDFT` (`raspa_credor`): nasce o crédito, o `credito_fonte` com a lista no metadata (`lista`:
@@ -113,9 +121,9 @@ ligado, só o credor); `creditos.processo.metadata.capa_pje` com `fonte: pje_con
 
 ## Saídas (`TJDF/saida/`, fora do git)
 
-`carga_TJDF_*.csv`, `carga_TJDF_fora_*.csv`, `fetch_TJDF.csv` (1 linha por crédito), `fetch_credores_trocados.csv`,
-`fetch_legado_backup.csv`, `desfazer_legado_*.sql`, `desfazer_fila_*.sql`, `djen_coorpre/`; na simulação, os mesmos
-nomes com `_simulacao`.
+`carga_TJDF_*.csv`, `carga_TJDF_fora_*.csv`, `fetch_TJDF.csv` (1 linha por crédito), `fetch_credores_trocados.csv`
+e `djen_coorpre/`; com `--com-desfazer`, também `fetch_legado_backup.csv`, `desfazer_legado_*.sql` e
+`desfazer_fila_*.sql`; na simulação, os mesmos nomes com `_simulacao`.
 
 ## Banco (05/10/2026)
 
