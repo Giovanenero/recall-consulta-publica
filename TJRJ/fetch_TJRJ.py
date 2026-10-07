@@ -1,12 +1,13 @@
 """
 fetch_TJRJ.py - credor dos precatórios do TJRJ pela consulta pública, sem login e SEM token A3: lê o banco, consulta o
 processo originário (DCP ou PJe 1º grau, HTTP puro), decide o credor do precatório e grava no banco em lotes de LOTE
-créditos (LOTE_GRAVACAO_TJRJ no .env). No lugar do modo credor do RPA_SISTEMAS para o TJRJ.
+créditos (constante abaixo). No lugar do modo credor do RPA_SISTEMAS para o TJRJ.
 
 O originário já vem da lista do TJRJ (lista_item.metadata.NumeroProcOriginario, ligado em credito_originario), então:
 1. Fila: ordem própria (T1 não pagos na fila cronológica -> T2 outros não pagos -> T3 pagos; maior valor primeiro).
    Entra todo lead com originário CNJ do TJRJ (com ou sem máscara), inclusive os que saíram da lista e os de número
-   malformado na carga legada (usa o número da lista); sem originário (ou de outro tribunal) fica para o RPA. Cada crédito é reservado com lease (reservar) e só nessa hora
+   malformado na carga legada (usa o número da lista); sem originário (ou de outro tribunal) fica para o RPA. Cada crédito é reservado com lease (reservar), também nas filas mensais do RPA
+   antigo (CREDOR_EM_ANDAMENTO com a marca do robô: o RPA não o pega), e só nessa hora
    passa do RPA para o software próprio (CONSULTA_PUBLICA_TJRJ); o que o RPA tinha fica em desfazer_fila_*.sql.
 2. Originário '08...' (ou só no PJe): consulta pública do PJe 1º grau (reCAPTCHA desligado, 'if (false)'), que traz o
    polo ativo com CPF completo.
@@ -22,7 +23,11 @@ O originário já vem da lista do TJRJ (lista_item.metadata.NumeroProcOriginario
    Cessão ou herdeiro no precatório (portal de precatórios) -> SUCESSO_ANALISAR.
 6. Grava: credor com CPF -> SUCESSO_PROCESSO_ORIGINARIO (registrar_credor, origem FONTE); credor só com nome ->
    SUCESSO_INCOMPLETO com motivo 'SUCESSO_SEM_CPF: ...' (o banco não aceita credor sem CPF/OAB em credito_credor: o
-   nome vai para a capa do originário, como parte sem pessoa, e para credito_fonte.metadata).
+   nome vai para a capa do originário, como parte sem pessoa, e para credito_fonte.metadata). Antes de gravar, o
+   próprio robô consulta a API de CPF pelo nome, com o nascimento e o CPF tarjado da certidão (utils/cpf_robo.py,
+   decisão do usuário de 07/10/2026; regra, gate e cache do CPF_API/completar_cpf.py): aceito -> SUCESSO_API_TERCEIRO
+   com o credor ligado (a capa continua só com o que a fonte mostrou); senão fica SUCESSO_SEM_CPF com
+   metadata.cpf_api (o completar_cpf.py não consulta de novo).
    A capa só acrescenta (partes do banco + as novas); na ação coletiva vai só o credor confirmado, o polo passivo e o
    advogado daquele precatório (página do precatório no eJUD), para o recálculo do banco não ligar os outros autores
    e advogados aos precatórios dos outros credores. Legado como o TJMA: capa antiga (originarios.*) e status nas filas
@@ -30,7 +35,8 @@ O originário já vem da lista do TJRJ (lista_item.metadata.NumeroProcOriginario
 
 Erro passageiro (DCP/PJe/eJUD fora, timeout, captcha) devolve o crédito para a fila (fila_credor_adiar) na hora,
 nunca vira FALHA e não entra no lote. Ctrl+C devolve os créditos em andamento e grava o lote que já estava processado.
-CPF não vai para log, CSV, motivo nem detalhe da fila (só para credito_credor/pessoa e capas).
+CPF não vai para log, motivo nem detalhe da fila (só para credito_credor/pessoa e capas); o CPF da API aparece no CSV
+só mascarado.
 
 Saídas em TJRJ/saida: fetch_TJRJ.csv (1 linha por crédito), fetch_credores_trocados.csv, fetch_legado_backup.csv,
 desfazer_legado_*.sql, desfazer_fila_*.sql e o log em saida/logs.
@@ -42,6 +48,7 @@ Uso:
     python fetch_TJRJ.py --limite 50            # para depois de 50 créditos
     python fetch_TJRJ.py --workers 4            # workers (threads) raspando ao mesmo tempo (padrão 6)
     python fetch_TJRJ.py --chromes 0            # sem o eJUD 2º grau (os leads do 2º grau ficam para o RPA)
+    python fetch_TJRJ.py --sem-cpf-api          # não consulta a API de CPF (fica para o completar_cpf.py)
 """
 import argparse
 import html as H
@@ -76,9 +83,11 @@ AQUI = Path(__file__).resolve().parent
 if str(AQUI.parent) not in sys.path:
     sys.path.insert(0, str(AQUI.parent))            # utils/ fica na raiz do projeto
 
-from utils import banco  # noqa: E402
+from utils import banco, cpf_robo  # noqa: E402
 from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
+from utils.legado import (limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
+                          reservar_filas_mensais, soltar_filas_mensais)
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 from utils.workers import matar_chrome_do_perfil  # noqa: E402
@@ -86,23 +95,17 @@ from utils.workers import matar_chrome_do_perfil  # noqa: E402
 # =============================================================================== configuração
 
 SAIDA = AQUI / "saida"
-load_dotenv(AQUI.parent / ".env")      # PG_* e LOTE_GRAVACAO_TJRJ
+load_dotenv(AQUI.parent / ".env")      # PG_*
 log = logging.getLogger("fetch_TJRJ")
-
-
-def lote_do_env():
-    """Créditos por transação de gravação, de LOTE_GRAVACAO_TJRJ no .env (inteiro maior que zero)."""
-    valor = os.environ.get("LOTE_GRAVACAO_TJRJ", "").strip()
-    if not valor.isdigit() or int(valor) < 1:
-        raise SystemExit(f"LOTE_GRAVACAO_TJRJ no .env precisa ser um inteiro maior que zero (veio {valor!r}).")
-    return int(valor)
 
 
 TRIBUNAL_TJRJ = 119
 SOFTWARE = "CONSULTA_PUBLICA_TJRJ"
+GERAR_DESFAZER = False                 # True com --com-desfazer: escreve os arquivos de desfazer (o padrão é não escrever)
 SOFTWARE_RPA = 2                       # RPA_CREDOR_V1
 WORKER = f"{socket.gethostname()}:TJRJ:consulta_publica:{os.getpid()}"
-LOTE = lote_do_env()                   # créditos por transação de gravação
+LOTE = 50                              # créditos por transação de gravação
+FILAS_MENSAIS = []                     # filas do RPA antigo com permissão de UPDATE (a Rodada preenche): reserva e status
 WORKERS = 6                            # workers (threads deste processo) raspando ao mesmo tempo (--workers)
 TETO_CREDITO = 5 * 60                  # s por crédito; passou disso, volta para a fila
 ADIAMENTO = "30 minutes"               # erro passageiro
@@ -183,6 +186,8 @@ RE_BRUTO = re.compile(r"VALOR (?:BRUTO|TOTAL)[^R$]{0,25}R\$\s*([\d\.]+,\d{2})")
 RE_NASC = re.compile(r"DATA DE NASCIMENTO(?: DO BENEFICIARIO)?\s*:?\s*(\d{2}/\d{2}/\d{4})")
 RE_CPF = re.compile(r"(?<!\d)(\d{3})\.?(\d{3})\.?(\d{3})-?(\d{2})(?!\d)")
 RE_CPF_ROTULO = re.compile(r"CPF[^0-9]{0,25}(\d{3}\.?\d{3}\.?\d{3}-?\d{2})(?!\d)")
+# CPF tarjado na certidão ('CPF: ***.340.134-**'): guardado para a API de CPF casar os dígitos visíveis
+RE_CPF_TARJADO = re.compile(r"CPF[^0-9*]{0,25}([\d*xX]{3}\.?[\d*xX]{3}\.?[\d*xX]{3}-?[\d*xX]{2})(?![\d*])")
 # o CPF logo depois de um nome não é dele se no meio (ou logo antes do nome) aparece um destes
 RE_OUTRA_PESSOA = re.compile(r"PERIT|ADVOG|\bOAB\b|CURADOR|PATRONO|PROCURADOR|INVENTARIANTE|REPRESENTANTE")
 
@@ -216,8 +221,8 @@ SISTEMA_BANCO = {"PJE": "PJE", "EPROC": "EPROC"}
 
 COLUNAS = ["processado_em", "modo", "credito_id", "precatorio", "faixa", "ente", "originario", "sistema", "resultado",
            "motivo", "regra", "fontes", "credor", "cpf_encontrado", "data_nascimento", "n_autores", "n_precatorios",
-           "coletiva", "advogados", "banco", "legado", "credor_corrigido", "credores_antes", "credores_depois", "lote",
-           "segundos"]
+           "coletiva", "advogados", "banco", "legado", "credor_corrigido", "credores_antes", "credores_depois", "cpf_api",
+           "lote", "segundos"]
 COLUNAS_TROCAS = ["processado_em", "modo", "credito_id", "precatorio", "credores_antes", "credores_depois",
                   "saiu", "entrou"]
 COLUNAS_BACKUP = ["rodada", "modo", "credito_id", "op", "tabela", "chave", "antes"]
@@ -437,9 +442,13 @@ def certidoes_do_texto(texto):
         if c and not RE_OUTRA_PESSOA.search(trecho[:c.start()]):
             d = so_digitos(c.group(1))
             cpf = d if len(d) == 11 and documento_valido(d) else None
+        tarjado = None
+        t = None if cpf else RE_CPF_TARJADO.search(trecho)
+        if t and re.search(r"[*xX]", t.group(1)) and not RE_OUTRA_PESSOA.search(trecho[:t.start()]):
+            tarjado = t.group(1)
         achadas.append({"nome": " ".join(m.group(1).split()).strip(" .-"),
                         "valor": valor_numerico(valor.group(1)) if valor else None,
-                        "nascimento": nasc.group(1) if nasc else None, "cpf": cpf})
+                        "nascimento": nasc.group(1) if nasc else None, "cpf": cpf, "cpf_mascarado": tarjado})
     return achadas
 
 
@@ -874,7 +883,7 @@ def partes_da_pagina(html):
         achados.append({"nome": " ".join(m.group(1).split()),
                         "oab_uf": m.group(2) or "", "oab_numero": m.group(3) or "",
                         "documento": so_digitos(m.group(5)), "papel": " ".join(m.group(6).split()).upper(),
-                        "polo": polo})
+                        "polo": polo, "mascara": m.group(5) if m.group(5) and "*" in m.group(5) else ""})
     return achados
 
 
@@ -1224,7 +1233,7 @@ def processar_pje(lead, pje, http, r, inicio):
     doc = p["documento"] if len(p["documento"]) == 11 and documento_valido(p["documento"]) else ""
     regra = "AUTOR_UNICO" if lead["n_creditos_originario"] <= 1 else "AUTOR_UNICO_VARIOS_PREC"
     r["credor"] = {"nome": p["nome"], "documento": doc, "como": regra, "nascimento": None,
-                   "papel_bruto": p["papel"]}
+                   "papel_bruto": p["papel"], "mascara": "" if doc else p.get("mascara", "")}
     if regra == "AUTOR_UNICO_VARIOS_PREC" and not e_o_principal(r, lead):
         return r
     if not conferir_portal(http, lead, r):
@@ -1320,6 +1329,7 @@ def decidir(lead, http, dcp, r):
     if certidoes and len({chave_nome(c["nome"]) for c in certidoes}) == 1:
         c = certidoes[0]
         credor = {"nome": c["nome"], "documento": c["cpf"] or "", "como": "CERTIDAO_VALOR",
+                  "mascara": "" if c["cpf"] else (c.get("cpf_mascarado") or ""),
                   "nascimento": next((x["nascimento"] for x in certidoes if x["nascimento"]), None),
                   "papel_bruto": "BENEFICIARIO DO PRECATORIO"}
         regra = "CERTIDAO_VALOR"
@@ -1347,6 +1357,9 @@ def decidir(lead, http, dcp, r):
     if credor.get("nascimento") is None:
         credor["nascimento"] = next((c["nascimento"] for c in dcp["certidoes"]
                                      if c["nascimento"] and mesma_pessoa(c["nome"], credor["nome"])), None)
+    if not credor["documento"] and not credor.get("mascara"):
+        credor["mascara"] = next((c["cpf_mascarado"] for c in dcp["certidoes"]
+                                  if c.get("cpf_mascarado") and mesma_pessoa(c["nome"], credor["nome"])), "")
     if regra == "CERTIDAO_VALOR":
         r["fontes"].append("CERTIDAO")
     if not conferir_portal(http, lead, r):
@@ -1424,7 +1437,7 @@ class Backup:
     def confirmar_lote(self, manter):
         """Depois do COMMIT (ou do ROLLBACK da simulação): escreve o SQL e o CSV de cada crédito do lote;
         manter=False (simulação) não lembra as linhas tocadas."""
-        for credito_id, sql, linhas in self.l_creditos:
+        for credito_id, sql, linhas in (self.l_creditos if GERAR_DESFAZER else []):
             novo = not self.arquivo_sql.exists()
             with open(self.arquivo_sql, "a", encoding="utf-8") as f:
                 if novo:
@@ -1584,13 +1597,17 @@ def atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk):
                                         creditos.so_digitos(numero_precatorio)) = %s
                            FOR UPDATE""", (lead["numero_norm"][:20].rjust(20, "0"), lead["numero_norm"]))
         for linha in como_dicts(cur):
-            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO":
+            reservada = reserva_de_robo(linha)
+            if linha["status_coleta_lead"] == "CREDOR_EM_ANDAMENTO" and not reservada:
                 cont["fila_pulada"] += 1
                 continue
             chave = {"id_processo": linha["id_processo"], "numero_precatorio": linha["numero_precatorio"],
                      "tribunal_origem": "TJRJ"}
-            bk.update(cur, fila, chave, {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead",
-                                                             "numero_originario", "ultima_atualizacao")})
+            antes = {k: linha[k] for k in ("status_coleta_lead", "motivo_coleta_lead", "numero_originario",
+                                           "ultima_atualizacao")}
+            if reservada:
+                antes.update(status_coleta_lead=None, motivo_coleta_lead=None)
+            bk.update(cur, fila, chave, antes)
             cur.execute(f"""UPDATE {fila}
                                SET status_coleta_lead = %s, motivo_coleta_lead = %s,
                                    numero_originario = COALESCE(%s::text[], numero_originario),
@@ -1617,12 +1634,16 @@ def registrar_metadata(cur, lead, r):
                      "coletiva": r["coletiva"], "n_autores": len(r["autores"]), "n_precatorios_originario":
                      r["n_precatorios"], "n_creditos_originario_banco": lead["n_creditos_originario"]}
     meta["credor"] = ({"nome": credor["nome"], "como": credor["como"], "papel": credor.get("papel_bruto"),
-                       "data_nascimento": credor.get("nascimento"), "cpf_encontrado": bool(credor["documento"])}
+                       "data_nascimento": credor.get("nascimento"), "cpf_encontrado": bool(credor["documento"]),
+                       "cpf_mascarado": (credor.get("mascara") or None) if not credor["documento"] else None}
                       if credor else None)
     meta["advogados"] = [{"nome": a["nome"], "oab": f"{a['oab_uf']}{a['oab_numero']}"} for a in r["advogados"]]
     meta["autores"] = r["autores"][:50] if r["status"] == "SUCESSO_ANALISAR" else []
     meta["precatorio_cnj"] = cnj_precatorio(lead["precatorio"])
     meta["flags"] = r["flags"]
+    if r.get("cpf_api"):
+        meta["cpf_api"] = cpf_robo.metadata_cpf_api(r["cpf_api"], (credor or {}).get("nascimento"),
+                                                    (credor or {}).get("mascara"))
     meta["lista"] = {"faixa": lead["faixa"], "prioridade": lista.get("Prioridade"),
                      "precatorio_pai": lista.get("NumeroPrecatorioPai"), "valor_historico": lead["valor_historico"]}
     cur.execute("""SELECT 1 FROM creditos.credito WHERE id = %s
@@ -1680,7 +1701,12 @@ def gravar(cur, lead, r, filas, status_legado, bk):
                                                             p_documento => %s, p_processo_id => %s, p_fonte => %s)""",
                         (cid, credor["nome"], credor["documento"], proc, SOFTWARE))
             corrigidos = corrigir_credor(cur, lead, credor, bk)
-    if r["capa"] and r["status"] in STATUS_COM_CREDOR and r["originario"]:
+    # CPF pela API de CPF (consultada no processar_credito): liga o credor antes do registrar_capa (origem que o
+    # recálculo das partes não apaga); a capa continua só com o que a fonte mostrou
+    status_fonte, res_api, vinculo_api = r["status"], r.get("cpf_api"), None
+    if res_api and res_api["aceito"] and status_fonte == "SUCESSO_INCOMPLETO":
+        vinculo_api = cpf_robo.ligar_credor(cur, cid, credor["nome"], res_api, proc)
+    if r["capa"] and status_fonte in STATUS_COM_CREDOR and r["originario"]:
         cnj = r["originario"]
         travar_processo(cur, cnj)
         partes, advogados = partes_para_banco(cur, r["capa"], partes_do_banco(cur, formatar_cnj(cnj)))
@@ -1692,18 +1718,24 @@ def gravar(cur, lead, r, filas, status_legado, bk):
         resumo = (f"{formatar_cnj(cnj)}: partes +{res['partes_inseridas']}/-{res['partes_removidas']} "
                   f"credores +{res['credores_inseridos']}/-{res['credores_removidos']}")
         legado += gravar_capa_legado(cur, cnj, r["capa"], True, lead["precatorio"], bk)
+    detalhe = {"software": SOFTWARE, "regra": r["regra"], "fontes": "+".join(r["fontes"]), "sistema": r["sistema"],
+               "coletiva": r["coletiva"], "n_autores": len(r["autores"]), "n_precatorios": r["n_precatorios"]}
+    if vinculo_api:
+        r["status"], r["motivo"], detalhe = cpf_robo.motivo_e_detalhe(
+            res_api, formatar_cnj(r["originario"]) if r["originario"] else None, r["motivo"], detalhe, SOFTWARE)
     registrar_metadata(cur, lead, r)
     legado += atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk)
     depois = credores_do_credito(cur, cid)
-    detalhe = {"software": SOFTWARE, "regra": r["regra"], "fontes": "+".join(r["fontes"]), "sistema": r["sistema"],
-               "coletiva": r["coletiva"], "n_autores": len(r["autores"]), "n_precatorios": r["n_precatorios"],
-               "credores_antes": fmt_credores(antes), "credores_depois": fmt_credores(depois)}
+    detalhe.update(credores_antes=fmt_credores(antes), credores_depois=fmt_credores(depois))
     cur.execute("""SELECT creditos.fila_credor_finalizar(p_credito_id => %s, p_worker => %s, p_status => %s,
                                                          p_motivo => %s, p_via => %s, p_sistema => %s,
                                                          p_processo_cnj => %s, p_detalhe => %s::jsonb, p_host => %s)""",
                 (cid, WORKER, r["status"], r["motivo"][:2000], r["via"], SISTEMA_BANCO.get(r["sistema"]),
                  formatar_cnj(r["originario"]) if r["originario"] else None,
                  json.dumps(detalhe, ensure_ascii=False, default=str), socket.gethostname()))
+    tentativa = cur.fetchone()[0]
+    if vinculo_api:
+        cpf_robo.marcar_vinculo(cur, vinculo_api, tentativa)
     return {"banco": resumo, "legado": ", ".join(f"{k}={v}" for k, v in sorted(legado.items())),
             "antes": antes, "depois": depois, "corrigidos": corrigidos}
 
@@ -1715,6 +1747,7 @@ def marcar_falha(cur, credito_id, erro):
     falhar, o lote segue)."""
     cur.execute("SAVEPOINT falha")
     try:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJRJ", WORKER)
         cur.execute("""SELECT creditos.fila_credor_finalizar(p_credito_id => %s, p_worker => %s,
                           p_status => 'FALHA', p_motivo => %s, p_host => %s)""",
                     (credito_id, WORKER, erro, socket.gethostname()))
@@ -1785,7 +1818,8 @@ def registrar_lote(rod, lote, gravados):
                            "entrou": fmt_credores(entrou)})
         linha.update(resultado=r["status"], motivo=r["motivo"], banco=g["banco"], legado=g["legado"],
                      credor_corrigido=" | ".join(g["corrigidos"]), credores_antes=fmt_credores(g["antes"]),
-                     credores_depois=fmt_credores(g["depois"]), lote=rod.n_lote)
+                     credores_depois=fmt_credores(g["depois"]), lote=rod.n_lote,
+                     cpf_api=cpf_robo.texto_csv(r.get("cpf_api")))
         rod.resultados[r["status"]] += 1
     anexar_csv(rod.arq_credito, COLUNAS, [item["linha"] for item in lote])
     if trocas:
@@ -1815,7 +1849,9 @@ def descarregar(rod, pendentes):
 def reservar(con, credito_id, lease, id_software):
     """Reserva UM crédito (lease para este worker) se ele ainda é pegável, passando-o para o software do robô nesse
     momento (a fila do RPA só muda lead a lead, no que o robô de fato pega). UPDATE atômico: se outra instância já o
-    pegou, não afeta nenhuma linha. Devolve (software, status, disponivel_em) de antes, ou None."""
+    pegou, não afeta nenhuma linha. Na mesma transação reserva as linhas do precatório nas filas mensais do RPA antigo;
+    se o RPA (token A3) está com uma delas, desfaz tudo e não pega. Devolve (software, status, disponivel_em) de antes,
+    ou None."""
     with con.cursor() as cur:
         cur.execute(f"""WITH alvo AS (
                           SELECT cc.credito_id, cc.software_id, cc.status_id, cc.disponivel_em
@@ -1832,6 +1868,11 @@ def reservar(con, credito_id, lease, id_software):
                         RETURNING alvo.software_id, alvo.status_id, alvo.disponivel_em""",
                     (credito_id, TRIBUNAL_TJRJ, id_software, WORKER, lease))
         antes = cur.fetchone()
+        if antes and not reservar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJRJ",
+                                                WORKER):
+            con.rollback()
+            log.info(f"{credito_id}: o RPA está processando o precatório (fila mensal em andamento); fica para depois")
+            return None
     con.commit()
     return antes
 
@@ -1839,7 +1880,7 @@ def reservar(con, credito_id, lease, id_software):
 def anotar_desfazer_fila(rod, credito_id, antes):
     """Lead que era do RPA: guarda o UPDATE que o devolve ao RPA com o status de antes (desfazer_fila_<rodada>.sql)."""
     software, status, disponivel = antes
-    if software != SOFTWARE_RPA:
+    if software != SOFTWARE_RPA or not GERAR_DESFAZER:
         return
     arquivo = SAIDA / f"desfazer_fila_{rod.rodada}.sql"
     novo = not arquivo.exists()
@@ -1870,8 +1911,9 @@ def pegar(rod):
 
 def devolver_ao_rpa(con, credito_id):
     """Lead reservado que está fora do escopo do robô (sem originário; 2º grau com --chromes 0): volta para o RPA
-    em PENDENTE."""
+    em PENDENTE (e solta a reserva nas filas mensais)."""
     with con.cursor() as cur:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJRJ", WORKER)
         cur.execute(f"""UPDATE creditos.coleta_credor
                            SET software_id = {SOFTWARE_RPA}, status_id = 1, lease_worker = NULL, lease_ate = NULL,
                                reservado_em = NULL, updated_at = now()
@@ -1882,6 +1924,7 @@ def devolver_ao_rpa(con, credito_id):
 def devolver(con, credito_id, motivo=None, intervalo=ADIAMENTO):
     """Volta para a fila daqui a `intervalo` (erro passageiro); sem motivo (Ctrl+C), volta já."""
     with con.cursor() as cur:
+        soltar_filas_mensais(cur, FILAS_MENSAIS, numero_do_credito(cur, credito_id) or "", "TJRJ", WORKER)
         if motivo:
             cur.execute("SELECT creditos.fila_credor_adiar(%s, %s, %s::interval, %s)",
                         (credito_id, WORKER, intervalo, motivo[:2000]))
@@ -1897,7 +1940,7 @@ class Rodada:
     Chromes do eJUD 2º grau e contadores. Ao nascer confere o reCAPTCHA do DCP, prepara o banco (software, filas
     antigas, status do legado) e a ordem da fila (na simulação, a amostra sai dela e nada é reservado)."""
 
-    def __init__(self, simulacao, limite, workers, ritmo=RITMO_TJRJ, creditos=(), chromes=CHROMES):
+    def __init__(self, simulacao, limite, workers, ritmo=RITMO_TJRJ, creditos=(), chromes=CHROMES, usar_cpf_api=True):
         SAIDA.mkdir(exist_ok=True)
         self.simulacao, self.limite, self.workers = simulacao, limite, workers
         self.modo, sufixo = ("SIMULACAO", "_simulacao") if simulacao else ("REAL", "")
@@ -1919,6 +1962,8 @@ class Rodada:
             raise SystemExit("O DCP do TJRJ voltou a exigir reCAPTCHA (recuperar-site-key devolveu uma chave): "
                              "o robô não roda assim.")
         self.ultimo_captcha = time.time()
+        self.cpf_api = cpf_robo.CpfNoRobo("TJRJ", "RJ", ligar=usar_cpf_api)
+        log.info(f"API de CPF {self.cpf_api.motivo}")
 
         self.con = conectar(escrita=True)
         with self.con.cursor() as cur:
@@ -1927,6 +1972,7 @@ class Rodada:
             cur.execute("SELECT codigo, codigo_legado FROM creditos.status_coleta")
             self.status_legado = {codigo: legado or codigo for codigo, legado in cur.fetchall()}
         self.con.commit()
+        FILAS_MENSAIS[:] = self.filas
         log.info(f"{self.modo} | worker {WORKER} | software {SOFTWARE} (id {self.id_software}) | lote de {LOTE} | "
                  f"{workers} workers | ritmo {ritmo:.1f} req/s (PJe {self.ritmo_pje.teto:.1f}) | "
                  f"eJUD 2º grau: {f'{chromes} Chrome(s), {INTERVALO_EJUD:.0f} s entre páginas, pausa de {PAUSA_EJUD // 60} min se o reCAPTCHA recusar' if chromes else 'desligado'} | lease {self.lease} | "
@@ -1954,7 +2000,13 @@ class Rodada:
         return ordem
 
     def reordenar(self):
-        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA)."""
+        """Remonta a ordem da fila e volta ao começo dela (repete a cada REORDENAR_A_CADA). Antes, solta nas filas
+        mensais as reservas de robô que ficaram sem dono (robô que caiu)."""
+        with self.con.cursor() as cur:
+            soltas = limpar_reservas_orfas(cur, self.filas, "TJRJ")
+        self.con.commit()
+        if soltas:
+            log.info(f"filas mensais: {soltas} reserva(s) de robô sem dono soltas")
         self.ordem, self.posicao, self.ultima_ordem = self.ordenar(), 0, time.time()
 
     def da_thread(self):
@@ -2016,6 +2068,11 @@ def processar_credito(rod, credito_id, n):
         linha.update(precatorio=lead["precatorio"], faixa=lead["faixa"], ente=lead["ente"],
                      originario=formatar_cnj(lead["originario"]) if lead["originario"] else "")
         r = processar(lead, http, pje, rod.ejud, rod.cache, inicio)
+        c = r["credor"]
+        if (r["status"] == "SUCESSO_INCOMPLETO" and r["regra"] != "HONORARIOS_ADVOGADO" and c
+                and not c["documento"]):
+            # credor só com nome: a API de CPF já aqui (a gravação liga se a regra aceitou; utils/cpf_robo.py)
+            r["cpf_api"] = rod.cpf_api.consultar(c["nome"], c.get("nascimento"), c.get("mascara"), c.get("papel_bruto"))
         if time.time() - inicio > TETO_CREDITO:
             raise ErroTecnico("TIMEOUT_PAGINA_PROCESSO: o crédito passou do tempo máximo")
     except Exception as e:                              # erro passageiro (ou inesperado): volta para a fila
@@ -2089,11 +2146,11 @@ def encerrar(rod, pendentes, inicio):
     minutos = max((time.time() - inicio) / 60, 1 / 60)
     log.info(f"{rod.modo}: {rod.n} crédito(s) em {rod.n_lote} lote(s), {minutos:.1f} min "
              f"({rod.n / minutos:.1f}/min) | " + ", ".join(f"{k}: {v}" for k, v in rod.resultados.most_common()))
-    log.info(f"CSV: {rod.arq_credito}")
+    log.info(f"API de CPF: {rod.cpf_api.chamadas_api} chamada(s) | CSV: {rod.arq_credito}")
 
 
 def ler_argumentos():
-    """--simulacao, --limite N, --workers N, --ritmo, --chromes N e --creditos."""
+    """--simulacao, --limite N, --workers N, --ritmo, --chromes N, --creditos, --sem-cpf-api, --com-desfazer e --sem-desfazer."""
     ap = argparse.ArgumentParser(description="Credor do TJRJ pela consulta pública (DCP + PJe 1º grau + eJUD 2º grau, "
                                              f"sem A3), gravado no banco em lotes de {LOTE}.")
     ap.add_argument("--simulacao", action="store_true",
@@ -2107,7 +2164,16 @@ def ler_argumentos():
                     help=f"Chromes abertos para o eJUD 2º grau (padrão {CHROMES}); 0 deixa os leads do 2º grau para o RPA")
     ap.add_argument("--creditos", default="",
                     help="só na simulação: ids de crédito separados por vírgula (no lugar dos primeiros da fila)")
-    return ap.parse_args()
+    ap.add_argument("--sem-cpf-api", action="store_true",
+                    help="não consulta a API de CPF (o credor sem CPF fica para o CPF_API/completar_cpf.py)")
+    ap.add_argument("--com-desfazer", action="store_true",
+                    help="escreve os arquivos de desfazer (desfazer_*.sql e backup .csv); o padrão é não escrever")
+    ap.add_argument("--sem-desfazer", action="store_true",
+                    help="não escreve os arquivos de desfazer (já é o padrão; os ciclos do modo 5 do RPA passam)")
+    args = ap.parse_args()
+    global GERAR_DESFAZER
+    GERAR_DESFAZER = args.com_desfazer and not args.sem_desfazer
+    return args
 
 
 def main():
@@ -2121,7 +2187,8 @@ def main():
         raise SystemExit("--creditos só vale com --simulacao")
     if args.ritmo <= 0:
         raise SystemExit("--ritmo precisa ser maior que zero")
-    rod = Rodada(args.simulacao, args.limite, max(1, args.workers), args.ritmo, creditos, max(0, args.chromes))
+    rod = Rodada(args.simulacao, args.limite, max(1, args.workers), args.ritmo, creditos, max(0, args.chromes),
+                 usar_cpf_api=not args.sem_cpf_api)
     pendentes, em_voo = [], {}
     executor = ThreadPoolExecutor(max_workers=rod.workers, thread_name_prefix="tjrj")
     try:

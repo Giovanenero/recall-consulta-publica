@@ -43,7 +43,11 @@ Com 12 falhas técnicas seguidas, o robô para: o TJRJ caiu ou está bloqueando.
 
 Enquanto a thread principal grava um lote, os workers seguem com a fila (até 2× workers créditos em voo).
 
-- **`.env`:** `PG_*` e `LOTE_GRAVACAO_TJRJ` (créditos por transação, inteiro maior que zero). Nada de proxy.
+- **`.env`:** `PG_*`. Nada de proxy. O lote de gravação (créditos por transação) é a constante `LOTE` no início do
+  robô (50).
+- **Reserva:** cada lead pego fica reservado também nas filas mensais do RPA antigo (`CREDOR_EM_ANDAMENTO` com o
+  motivo `CONSULTA_PUBLICA_RESERVA: <worker>`), para o RPA com token A3 não o pegar; a gravação troca a marca pelo
+  resultado e a devolução (erro passageiro, fora do escopo, Ctrl+C) a solta. Ver `utils/legado.py`.
 - **Chrome:** o DCP, o PJe e o portal são HTTP puro. Só o eJUD 2º grau usa o **Chrome instalado**, por CDP, com o
   `patchright` (ou o `playwright`):
   - cada Chrome tem perfil próprio, `TJRJ/.chrome-profile-ejud-N`, fora do git;
@@ -113,7 +117,8 @@ Enquanto a thread principal grava um lote, os workers seguem com a fila (até 2�
 | Situação | Status em `coleta_credor` | Motivo (só códigos, sem nome nem CPF) |
 |---|---|---|
 | Credor definido **com CPF** (PJe, ou certidão ou texto do DCP com o CPF logo depois do nome dele) | `SUCESSO_PROCESSO_ORIGINARIO` | `cnj=… regra=… fontes=…` |
-| Credor definido **só com nome** | `SUCESSO_INCOMPLETO` | `SUCESSO_SEM_CPF: cnj=… regra=… fontes=…` |
+| Credor só com nome, CPF aceito pela API de CPF (consultada pelo próprio robô desde 07/10/2026, `utils/cpf_robo.py`; `--sem-cpf-api` desliga) | `SUCESSO_API_TERCEIRO` | `CPF_API: <regra> cnj=…; SUCESSO_SEM_CPF: …` |
+| Credor definido **só com nome** (homônimo, fora da base ou de outra região na API) | `SUCESSO_INCOMPLETO` | `SUCESSO_SEM_CPF: cnj=… regra=… fontes=…` |
 | Ação coletiva sem certidão que decida, herdeiro ou habilitado sem certidão, PJe com mais de um requerente | `SUCESSO_ANALISAR` | `CREDOR_POLO_ATIVO_SEM_VINCULO: …` |
 | Autor único, mas o precatório vale menos da metade do maior precatório do mesmo originário (possível honorários do advogado) | `SUCESSO_ANALISAR` | `POSSIVEL_HONORARIOS: … razao=0.10` (até 35%) ou `PRECATORIO_MENOR_DO_PROCESSO: …` (35–50%) |
 | Autor único com vários precatórios, mas sem valor dos outros para comparar | `SUCESSO_ANALISAR` | `PRECATORIOS_SEM_VALOR_PARA_COMPARAR: …` |
@@ -194,8 +199,10 @@ O CPF nunca vai para log, CSV, motivo nem detalhe da fila, e o HTML do PJe não 
 |---|---|
 | `fetch_TJRJ.csv` (`_simulacao`) | 1 linha por crédito: faixa, originário, sistema, resultado, motivo, regra, fontes, credor, `cpf_encontrado`, nascimento, autores, precatórios do originário, advogados, o que mudou no banco e no legado, credores antes e depois (sem documento) |
 | `fetch_credores_trocados.csv` | Créditos cujos credores mudaram |
-| `desfazer_fila_<rodada>.sql` | Devolve ao RPA os leads que o robô pegou |
-| `desfazer_legado_<rodada>.sql` e `fetch_legado_backup.csv` | Desfaz as mudanças no legado e os vínculos de credor apagados |
+| `desfazer_fila_<rodada>.sql` | Só com `--com-desfazer`: devolve ao RPA os leads que o robô pegou |
+| `desfazer_legado_<rodada>.sql` e `fetch_legado_backup.csv` | Só com `--com-desfazer`: desfaz as mudanças no legado e os vínculos de credor apagados |
+
+Desde 07/10/2026 o padrão é não escrever o desfazer; `--sem-desfazer`, que os ciclos do modo 5 passam, continua aceito.
 
 ## Depois do robô: mandar o resto para o A3
 
