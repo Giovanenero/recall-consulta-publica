@@ -163,6 +163,7 @@ RE_CLASSE_FORA = re.compile(r"PENAL|CRIMIN|CARTA PRECATORIA|CARTA DE ORDEM|INQUE
 # fundos públicos (FREBOM, fundo da PM) são credores frequentes em RR; fundo de investimento (FIDC) não é público
 RE_ORGAO_PUBLICO = re.compile(r"^(?:ESTADO D|MUNICIPIO D|UNIAO\b|DISTRITO FEDERAL)|PROCURADORIA|DEFENSORIA PUBLICA|"
                               r"MINISTERIO PUBLICO|FAZENDA PUBLICA|PREFEITURA|CAMARA MUNICIPAL|TRIBUNAL D|"
+                              r"ADVOCACIA[- ]GERAL|"    # AGU: começa com ADVOCACIA, mas não é sociedade de advogados
                               r"INSTITUTO NACIONAL DO SEGURO SOCIAL|"
                               r"^FUNDO (?!.*INVESTIMENTO)(?:DE |MUNICIPAL|ESTADUAL|ESPECIAL|ROTATIVO)|"
                               r"CORPO DE BOMBEIROS|POLICIA MILITAR|POLICIA CIVIL")

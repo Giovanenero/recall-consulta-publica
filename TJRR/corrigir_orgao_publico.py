@@ -4,7 +4,9 @@ um ente público como credor (fundos estaduais: FREBOM, fundo da Polícia Milita
 
 O que aconteceu: na 1ª rodada real (02/10/2026) o RE_ORGAO_PUBLICO não reconhecia 'Fundo de Reequipamento do Corpo de
 Bombeiros...' e 'Fundo de Reaparelhamento ... da Polícia Militar...', e 6 créditos ficaram com o fundo como CREDOR. O
-robô foi corrigido; este script arruma o que já foi gravado, como os outros robôs fazem com credor público:
+robô foi corrigido; este script arruma o que já foi gravado, como os outros robôs fazem com credor público.
+Em 07/10/2026 o filtro passou a reconhecer também a ADVOCACIA GERAL DA UNIAO (crédito 1231459 tinha a AGU como
+CREDOR: o nome começa com ADVOCACIA e passava como sociedade de advogados). O script:
 - apaga os vínculos de CREDOR do crédito cuja pessoa é ente público (o fundo);
 - desliga o originário (credito_originario) e tira o precatório de originarios.processos_originarios
   .precatorio_relacionado, senão a sincronização do legado religa o originário;
