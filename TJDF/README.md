@@ -33,6 +33,11 @@ python TJDF/fetch_TJDF.py --workers 6 --ritmo 4      # padrão: 6 threads, até 
 - **Rodar até acabar a carga:** com a fila vazia, espera os créditos adiados por erro passageiro (30 min) e continua.
   Se uma rodada para (fonte fora, 8 falhas técnicas seguidas, banco caiu), começa outra depois de 5 min, até 300 vezes
   (~25 h de fonte fora antes de desistir).
+- **Ritmo do PJe:** 429/502/503/504/403 e conexão derrubada freiam todos os workers (metade do ritmo e pausa de 60 s).
+  O HTTP 500 não freia: é defeito do próprio processo no servidor (o `/dados` de alguns processos volta 500 sempre, em
+  0,1 s; ex.: o originário 0707163-66.2020.8.07.0018). O robô tenta 3 vezes com 2 s de intervalo; no `/dados` segue
+  sem ele (classe e assunto vêm da busca; sem vara, comarca e data), nos outros pedidos o crédito é adiado. Antes de
+  07/10, cada 500 freava todos e derrubava o ritmo para 0,3 req/s, e os créditos das INICIAIS passavam dos 8 min.
 - **Simulação:** não reserva nada na fila; faz as consultas e as gravações e dá ROLLBACK no fim de cada lote.
 - **Ctrl+C:** os créditos em andamento voltam para a fila e o lote já processado é gravado.
 - **Log:** terminal e `TJDF/saida/logs/fetch_TJDF_AAAAMMDD.log`.

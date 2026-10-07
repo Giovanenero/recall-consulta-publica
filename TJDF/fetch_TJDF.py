@@ -172,6 +172,8 @@ RE_CAB = re.compile(r"N\. (\d{7}-\d{2}\.\d{4}\.8\.07\.\d{4}) - ([A-ZÇÃÁÉÍÓ
 RE_POLO_A = re.compile(r"A: (.+?)\.(?=\s*Adv\(s\)|\s*A:|\s*R:|\s*$)")
 RE_POLO_R = re.compile(r"R: (.+?)\.(?=\s*Adv\(s\)|\s*A:|\s*R:|\s*$)")
 RE_ADV_DJE = re.compile(r"\b([A-Z]{2})0*(\d{1,7})[A-Z]? - ([A-ZÀ-Ü' ]+?)(?=,|\.|$)")
+RE_ADV_CERTIDAO = re.compile(r"Advogado do\(a\) [A-ZÀ-Ü ]+?: ([A-ZÀ-Ü' ]+?) - ([A-Z]{2})0*(\d{1,7})")
+RE_FIM_CERTIDAO = re.compile(r"C E R T I D|CERTID[ÃA]O|DECIS[ÃA]O|DESPACHO|N\. \d{7}-")
 RE_NOME_CPF = re.compile(r"([A-ZÀ-Ü][A-ZÀ-Ü'.\-&/ ]+?) \((CPF|CNPJ): ?([\d./\-]+)\)")
 # classes que não geram precatório contra o ente, e as recursais
 RE_CLASSE_FORA = re.compile(r"PENAL|CRIMIN|CARTA PRECATORIA|CARTA DE ORDEM|INQUERITO|ALVARA|INVENTARIO|ARROLAMENTO|"
@@ -246,6 +248,16 @@ def mesma_pessoa(a, b):
     """Mesmo nome, ou grafia próxima o bastante (SOUSA x SOUZA, acento)."""
     a, b = chave_nome(a), chave_nome(b)
     return bool(a and b) and (a == b or SequenceMatcher(None, a, b).ratio() >= SEMELHANCA_MESMA_PESSOA)
+
+
+def nome_cortado(a, b):
+    """Um nome é o outro cortado no fim ('ANA CLAUDIA R' / 'MANOEL RAIMUNDO N' x o nome inteiro): mesmas palavras,
+    a última abreviada."""
+    wa, wb = chave_nome(a).split(), chave_nome(b).split()
+    curto, longo = (wa, wb) if len(" ".join(wa)) <= len(" ".join(wb)) else (wb, wa)
+    if len(curto) < 2 or len(curto[-1]) > 2 or len(curto) > len(longo) or curto[:-1] != longo[:len(curto) - 1]:
+        return False
+    return longo[len(curto) - 1].startswith(curto[-1]) and curto != longo
 
 
 def eh_sociedade(nome):
@@ -456,6 +468,11 @@ class Dje:
                     doc = so_digitos(n.group(3))
                     if documento_valido(doc) and (n.group(1).strip(), doc) not in cpfs:
                         cpfs.append((n.group(1).strip(), doc))
+                # logo depois da lista: 'Advogado do(a) CREDOR: ROBERTO GOMES FERREIRA - DF11723-A' (quem é advogado)
+                resto = RE_FIM_CERTIDAO.split(p["texto"][m.end():m.end() + 1500], 1)[0]
+                for a in RE_ADV_CERTIDAO.finditer(resto):
+                    adv = advogado(a.group(1), a.group(2), a.group(3))
+                    advs.setdefault((adv["oab_uf"], adv["oab_numero"]), adv)
         return {"nomes": nomes, "cpfs": cpfs, "advogados": list(advs.values()), "n": len(pubs)}
 
     def processos_do_nome(self, nome):
@@ -668,12 +685,15 @@ class Pje:
         self.processos, self.evidencias, self.documentos = Cache(MAX_CACHE_PROCESSOS), Cache(), Cache(MAX_CACHE_PROCESSOS)
         self.chamadas, self.trava = Counter(), threading.Lock()
 
-    def _get(self, grau, caminho, **params):
-        """JSON da API; None se a API recusou (400/404); ErroTecnico se não respondeu."""
+    def _get(self, grau, caminho, opcional=False, **params):
+        """JSON da API; None se a API recusou (400/404) ou, em pedido opcional, se deu erro interno (500) 3 vezes;
+        ErroTecnico se não respondeu. O 500 é defeito do próprio processo no servidor (o /dados de alguns processos
+        volta 500 sempre, em 0,1 s), não carga: tenta de novo sem frear o ritmo de todos os workers."""
         tipo = "texto" if caminho.startswith("/documentos/") else (caminho.rsplit("/", 1)[-1] if "/" in caminho[1:]
                                                                    else "busca")
         with self.trava:
             self.chamadas[tipo] += 1
+        internos = 0
         for tentativa in range(5):
             self.ritmo.esperar(self.parar)
             try:
@@ -687,10 +707,23 @@ class Pje:
                     return r.json()
                 except ValueError:
                     return None
-            if r.status_code in HTTP_FREIA or r.status_code >= 500:
+            if r.status_code == 500:
+                internos += 1
+                if internos == 3:
+                    break
+                if self.parar.wait(2):
+                    raise ErroTecnico("INTERROMPIDO")
+                continue
+            if r.status_code in HTTP_FREIA or r.status_code > 500:
                 self.ritmo.freia(f"HTTP {r.status_code}")
                 continue
             return None
+        if internos == 3:
+            with self.trava:
+                self.chamadas[f"{tipo} com HTTP 500"] += 1
+            if opcional:
+                return None
+            raise ErroTecnico(f"PESQUISA_SEM_RESPOSTA: PJe do TJDFT com erro interno (HTTP 500) em {tipo}")
         raise ErroTecnico("PESQUISA_SEM_RESPOSTA: PJe consulta pública do TJDFT não respondeu")
 
     def _paginas(self, grau, caminho, maximo):
@@ -715,7 +748,9 @@ class Pje:
         if not res:
             return self.processos.put(cnj20, None)
         pid = res[0]["idProcesso"]
-        dados = (self._get(grau, f"/processos/{pid}/dados") or {}).get("result") or {}
+        # /dados quebrado no servidor (HTTP 500 sempre, em alguns processos): segue com classe e assunto da busca, sem
+        # vara, comarca e data (sem data, o candidato não é descartado por ter sido distribuído depois do precatório)
+        dados = (self._get(grau, f"/processos/{pid}/dados", opcional=True) or {}).get("result") or {}
         proc = {"numero": cnj20, "grau": grau, "id": pid,
                 "classe": re.sub(r"\s*\(\d+\)\s*$", "", dados.get("classeJudicial") or res[0].get("classe") or ""),
                 "vara": dados.get("orgaoJulgador") or "", "comarca": dados.get("jurisdicao") or "",
@@ -909,8 +944,35 @@ def credores_do_credito(cur, credito_id):
 class Fontes:
     """As fontes de uma rodada, para as threads."""
 
-    def __init__(self, dje, djen, pje):
-        self.dje, self.djen, self.pje = dje, djen, pje
+    def __init__(self, dje, djen, pje, oabs=None):
+        self.dje, self.djen, self.pje, self.oabs = dje, djen, pje, oabs
+
+
+class OabsDoBanco:
+    """Advogados que o banco já conhece (creditos.pessoa_oab), pelo nome: separa do credor o advogado que aparece no
+    polo ativo do precatório sem nenhuma marca de advogado ali (honorários sucumbenciais). Conexão readonly por
+    thread, cache por nome."""
+
+    def __init__(self):
+        self.local, self.cache = threading.local(), Cache(MAX_CACHE_PROCESSOS)
+
+    def de(self, nome):
+        """[(uf, numero, documento)] das OABs das pessoas do banco com esse nome."""
+        chave = chave_nome(nome)
+        if chave in self.cache:
+            return self.cache.get(chave)
+        if getattr(self.local, "con", None) is None or self.local.con.closed:
+            self.local.con = conectar()
+        try:
+            with self.local.con.cursor() as cur:
+                cur.execute("""SELECT o.uf::text, o.numero::text, COALESCE(p.documento::text, '')
+                                 FROM creditos.pessoa p JOIN creditos.pessoa_oab o ON o.pessoa_id = p.id
+                                WHERE p.nome_chave = creditos.chave_texto(%s)""", (nome,))
+                linhas = cur.fetchall()
+        except psycopg2.Error:
+            self.local.con = None
+            return []
+        return self.cache.put(chave, linhas)
 
 # =============================================================================== decisão
 
@@ -960,15 +1022,31 @@ def dados_do_precatorio(lead, f):
     for nome in dje["nomes"]:
         if so_iniciais(nome):
             ini_djen.setdefault(iniciais(nome), nome)
-        elif do_credor(nome) and not any(mesma_pessoa(nome, p["nome"]) for p in pessoas.values()):
+        elif do_credor(nome) and not any(mesma_pessoa(nome, p["nome"]) or nome_cortado(nome, p["nome"])
+                                         for p in pessoas.values()):
             pessoas.setdefault(chave_nome(nome), {"nome": nome, "documento": ""})
     primeiros = {}
     for n in pistas_nomes:                               # nome inteiro no texto, ou 'SABINA N. M.'
         k = iniciais(n)
         if "." in n:
             primeiros.setdefault(k, n)
-        elif do_credor(n) and k in ini_djen and not any(mesma_pessoa(n, p["nome"]) for p in pessoas.values()):
+        elif do_credor(n) and k in ini_djen and not any(mesma_pessoa(n, p["nome"]) or nome_cortado(n, p["nome"])
+                                                          for p in pessoas.values()):
             pessoas.setdefault(chave_nome(n), {"nome": n, "documento": ""})
+    for k, p in list(pessoas.items()):                  # nome cortado sem CPF de quem já veio inteiro
+        if not p["documento"] and any(q is not p and nome_cortado(p["nome"], q["nome"])
+                                      and len(q["nome"]) > len(p["nome"]) for q in pessoas.values()):
+            pessoas.pop(k)
+    if len(pessoas) > 1 and f.oabs:                     # advogado (honorários) no polo ativo sem marca de advogado
+        for k, p in list(pessoas.items()):
+            oabs = f.oabs.de(p["nome"])
+            meu = [o for o in oabs if p["documento"] and o[2] == p["documento"]]
+            df = [o for o in oabs if o[0] == "DF"]
+            if meu or (not p["documento"] and df):
+                uf, numero, doc = (meu or df)[0]
+                a = advogado(p["nome"], uf, numero, p["documento"] or doc)
+                advs.setdefault((a["oab_uf"], a["oab_numero"]), a)
+                pessoas.pop(k)
     entidades = [n for n in dje["nomes"] + [d[0] for d in dje["cpfs"]] if eh_sociedade(n) or eh_orgao(n)]
     hon = next(({"nome": n, "documento": d} for n, d in dje["cpfs"] if eh_sociedade(n) and len(d) == 14), None)
     # iniciais do credor: as do DJEN tirando advogado e as de sociedade/órgão já vistas por extenso
@@ -1941,7 +2019,7 @@ class Rodada:
         self.con.commit()
         djen = Djen(self.parar)
         djen.carregar_coorpre()
-        self.fontes = Fontes(Dje(self.parar), djen, Pje(self.parar, ritmo))
+        self.fontes = Fontes(Dje(self.parar), djen, Pje(self.parar, ritmo), OabsDoBanco())
         log.info(f"{self.modo} | worker {WORKER} | software {SOFTWARE} (id {self.id_software}) | lote de {LOTE} | "
                  f"{workers} workers | lease {self.lease} | PJe {ritmo:.1f} req/s | DJe {RITMO_DJE:.1f} req/s")
         if simulacao:
