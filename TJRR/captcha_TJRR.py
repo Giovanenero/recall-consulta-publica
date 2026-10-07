@@ -35,8 +35,10 @@ import numpy as np
 
 try:
     from patchright.sync_api import Error as ErroNavegador, sync_playwright
+    NO_MUNDO_DA_PAGINA = {"isolated_context": False}    # o patchright roda o evaluate num mundo isolado por padrão
 except ImportError:
     from playwright.sync_api import Error as ErroNavegador, sync_playwright
+    NO_MUNDO_DA_PAGINA = {}                            # o playwright já roda no mundo da página (e não tem a opção)
 
 AQUI = Path(__file__).resolve().parent
 if str(AQUI.parent) not in sys.path:
@@ -372,7 +374,7 @@ class Muraki(_ChromeCaptcha):
         super().__init__(perfil)
 
     def _resolver(self):
-        self.pagina.evaluate(JS_ABRIR_MURAKI, [APP_MURAKI, SCRIPT_TENCENT, API_SGP], isolated_context=False)
+        self.pagina.evaluate(JS_ABRIR_MURAKI, [APP_MURAKI, SCRIPT_TENCENT, API_SGP], **NO_MUNDO_DA_PAGINA)
         token, expira = resolver_slider(self.pagina, self.imagens,
                                         lambda: (lambda t: t if t[0] else None)(self.pagina.evaluate(JS_TOKEN_MURAKI)))
         return token, expira / 1000
