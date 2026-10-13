@@ -10,11 +10,12 @@ Estado: em produção (software `CONSULTA_PUBLICA_TJAL`, id 4 em `creditos.softw
 ## Como rodar
 
 ```bash
-python TJAL/fetch_TJAL.py --simulacao   # faz tudo e dá ROLLBACK em cada lead: só gera o resumo
-python TJAL/fetch_TJAL.py               # GRAVA (avisa e espera 10 s: Ctrl+C cancela)
+python TJAL/fetch_TJAL.py               # a fila inteira (leads disponíveis); GRAVA (avisa e espera 10 s: Ctrl+C cancela)
+python TJAL/fetch_TJAL.py --simulacao   # a mesma fila, mas dá ROLLBACK em cada lead: só gera o resumo
 ```
 
-- **`--fila [--limite N]`** (modo 5 do RPA_SISTEMAS): só os leads em FALHA/PENDENTE que o robô não raspou nos
+- **Fila (o padrão, sem argumento nenhum; `--limite N` limita a rodada; `--fila` continua aceito porque o modo 5 do
+  RPA_SISTEMAS passa)**: só os leads em FALHA/PENDENTE que o robô não raspou nos
   últimos 7 dias (`DIAS_FILA`), com número CNJ do TJAL que bate com o crédito, do mais prioritário e de maior valor
   para o menor. Gravando, cada lead é **reservado** antes da raspagem: `coleta_credor` em EM_ANDAMENTO com lease do
   processo (`consulta_publica_tjal:<máquina>:<pid>`, 3 h), sem trocar o software, e as linhas do precatório nas filas
@@ -22,8 +23,11 @@ python TJAL/fetch_TJAL.py               # GRAVA (avisa e espera 10 s: Ctrl+C can
   RPA já está processando fica de fora). No fim, ou no Ctrl+C, o lead que não virou SUCESSO volta ao status de antes.
   Se o robô cair, o lease vence em 3 h e o banco devolve o lead como PENDENTE. A fila tem pasta de rodada própria
   (`*_fila-gravacao`, `*_fila-simulacao`).
-- Sem `--fila`, roda **todos** os leads do TJAL de uma vez. Uma rodada completa leva horas: o 1º grau do e-SAJ
-  só aceita uma consulta a cada ~1,6 s.
+- Desde 09/10/2026 não há mais o modo "todos os leads de uma vez": o que já foi processado (SUCESSO, ou raspado nos
+  últimos 7 dias) não volta. Para reprocessar um grupo, use `--creditos`. O 1º grau do e-SAJ só aceita uma consulta a
+  cada ~1,6 s.
+- **`--creditos 123,456`** (ou `--creditos arquivo.txt`, um id por linha): só esses créditos da lista, para
+  reprocessar um grupo (ex.: os créditos com advogado sem OAB). Pasta de rodada própria (`*_creditos-gravacao`).
 - **Retomada**: a raspagem guarda um checkpoint (`_progresso.jsonl`) na pasta da execução. Se for interrompida
   (Ctrl+C, queda), rodar o mesmo comando continua de onde parou; leads que deram erro são raspados de novo. O banco só
   é tocado depois que a raspagem inteira termina.
@@ -63,6 +67,10 @@ Filtros iniciais: número que não é CNJ -> `FALHA/NUMERO_NAO_CNJ`; CNJ de outr
      (`SIM`/`PARCIAL`/`NAO`) pelas movimentações de pagamento/alvará e pelo arquivamento.
    - `partes_e_advogados`: tabela `tableTodasPartes`; o polo vem da classe da linha ou do rótulo (Reqte, Credor,
      Exeqte... = ativo; Reqdo, Devedor, Executado... = passivo). No 2º grau a OAB vem de um `<input hidden>`.
+     No 1º grau a tabela só traz o nome do advogado: a OAB sai do texto das movimentações da mesma página
+     (`Advogados(s): Nome (OAB 7147/AL), ...`, também `9693AL /` e `14186B/AL`), pelo nome normalizado, e só
+     quando o nome tem uma única OAB ali (`oabs_das_movimentacoes`). Essa OAB vai para o schema `creditos` e para
+     `precatorios.advogados` (onde estiver vazia).
    - Ritmo (`Ritmo`, compartilhado entre as threads): 1,6 s entre consultas ao 1º grau (senão o e-SAJ bloqueia o IP
      por ~1 min com "múltiplas consultas simultâneas"); bloqueio detectado -> pausa de 45 s e repete (até 6 vezes).
      HTTP: até 4 tentativas com espera crescente para queda de conexão, timeout (75 s), 5xx e 429.
@@ -86,7 +94,7 @@ num `SAVEPOINT` (erro do Postgres desfaz só o passo). Documento da API com díg
 |---|---|---|
 | `garantir_software` | cadastra `CONSULTA_PUBLICA_TJAL` se faltar (`raspa_credor = false`) | `creditos.software` |
 | `situacao_e_originario` (`registrar_fonte`) | confere que o número bate com o crédito e chama `registrar_credito(PRECATORIO, TJAL, origem RASPAGEM)` com os originários (SAPRE + raspagem), `etapa` = status sugerido, `situacao` (`PAGO`, `PAGO_PARCIAL`, `ARQUIVADO`, `SUSPENSO`, `EM_ANDAMENTO`) e `metadata` (id SAPRE, natureza, capas) | `credito_fonte`, `credito_originario`, `processo` |
-| `partes_precatorio` / `partes_originario` (`registrar_capa`) | partes e advogados de cada capa. Só advogados do lado do credor (o procurador do ente viraria "advogado do lead"). Como a função troca o conjunto de partes, `juntar_com_banco` completa CPF/OAB faltantes pelo banco (mesmo nome) e devolve as partes que o banco tinha e a raspagem não trouxe — menos o credor que a API desmente. Pula a capa do precatório se o credor é órgão público | `processo`, `processo_parte`, `pessoa`, `pessoa_oab`, recálculo de `credito_credor` |
+| `partes_precatorio` / `partes_originario` (`registrar_capa`) | partes e advogados de cada capa. Só advogados do lado do credor (o procurador do ente viraria "advogado do lead"); desde 13/10 também fica de fora o representante que é o próprio ente ou o cargo ("Procurador Geral do Município de Maceió", OAB fictícia 99999P), mesmo no polo ativo (`procurador_do_ente`). Os gravados antes foram limpos em 13/10/2026 (2 vínculos; e o "REPRESENTA: …"/"PROCURADOR: …" colado no nome de 113 pessoas de cargas antigas) por um script de uma vez só, já removido. Como a função troca o conjunto de partes, `juntar_com_banco` completa CPF/OAB faltantes pelo banco (mesmo nome) e devolve as partes que o banco tinha e a raspagem não trouxe — menos o credor que a API desmente. Pula a capa do precatório se o credor é órgão público | `processo`, `processo_parte`, `pessoa`, `pessoa_oab`, recálculo de `credito_credor` |
 | `status` (`melhorar_status`) | só `FALHA`/`PENDENTE` -> `SUCESSO_*`, e só com CPF/CNPJ válido da API: `fila_credor_finalizar` (worker `consulta_publica_tjal`, sistema ESAJ, via `PROCESSO_CREDITO`/`ORIGINARIO`/`CONSULTA_PUBLICA`) | `coleta_credor`, `coleta_credor_tentativa` |
 | `fila_antiga_AAAA_MM` (`atualizar_fila_antiga`) | em cada fila mensal do RPA (de 2026_08 em diante, com permissão de UPDATE): credor da API em `requerentes` (se era outra pessoa) e status legado `CREDOR_SUCESSO_*` (se estava vazio ou `CREDOR_FALHA*`). Linha `CREDOR_EM_ANDAMENTO` não é tocada | `listas_primarias.processos_unificados_AAAA_MM` |
 | `capa_antiga_precatorio` (`atualizar_capa_antiga`) | capa antiga do precatório: credor da API (nome + CPF; tira outros "requerentes"), OAB dos advogados onde está vazia e CNPJ do devedor se vazio. Sem isso o espelho das capas antigas traria o credor errado de volta | `precatorios.processos_precatorios`, `partes_processuais`, `advogados` |

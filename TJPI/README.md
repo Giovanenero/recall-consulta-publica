@@ -2,7 +2,7 @@
 
 Robô de credor do TJPI (tribunal 118 em `creditos.tribunal`) pela **consulta pública, sem login e sem o token A3**.
 Ele toma o lugar do modo credor do RPA antigo (`RPA_CREDOR_V1`) nos leads do TJPI, por decisão do usuário
-(07/10/2026): só consulta pública. O CPF que a fonte não mostra fica para o `CPF_API/completar_cpf.py`.
+(07/10/2026): só consulta pública. O CPF que a fonte não mostra o próprio robô busca na API de CPF (abaixo).
 
 No TJPI o número do crédito é o **processo do próprio precatório** no PJe 2º grau (`07xxxxx-xx.AAAA.8.18.0000`). A
 lista não traz nome, CPF nem originário, e a consulta pública do PJe (1º e 2º grau) redireciona para o login do PDPJ
@@ -39,7 +39,7 @@ O CPF que o DJEN não mostra o próprio robô busca na API de CPF, pelo nome (`u
 
 - **Pega:** leads do TJPI em PENDENTE do RPA (software 2), os do RPA sem credor em qualquer status (menos
   EM_ANDAMENTO) e os PENDENTE do próprio robô, com `disponivel_em` vencido. Em 07/10/2026 eram só 4: o RPA com A3 e a
-  correção do legado (`corrigir_legado_TJPI.py`, 05/10) deixaram ~99% dos ativos com credor e CPF. O robô serve para
+  correção do legado (05/10) deixaram ~99% dos ativos com credor e CPF. O robô serve para
   os leads novos que a lista trouxer (~1.000 precatórios/ano).
 - **Ordem:** sem credor antes de com credor, prioridade de campanha, maior valor. Refeita a cada 30 minutos.
 - **Reserva:** um lead por vez, com lease. Nessa hora ele passa para `CONSULTA_PUBLICA_TJPI` (criado na 1ª execução
@@ -94,7 +94,15 @@ conferidos no DJEN do próprio candidato:
   cumprimento de 2021 que o banco tem (o mesmo advogado leva os dois);
 - 1 confirmado → liga com `fila_credor_registrar_originario` (sem capa: não há capa pública com partes); empate ou
   nenhum → candidatos só em `metadata.motor.candidatos`;
-- ação coletiva que já tem outros credores no banco → não liga (`ORIGINARIO_COLETIVO_NAO_LIGADO`).
+- ação coletiva que já tem outros credores no banco → não liga (`ORIGINARIO_COLETIVO_NAO_LIGADO`);
+- **originário provável (08/10/2026):** sem confirmado, o robô grava `metadata.originario_provavel` com a escala
+  comum de `utils/originario_provavel.py` (o mais provável, confiança `alta`/`media`/`baixa`, pontos, margem e até 5
+  candidatos com os sinais). Decisão do usuário: fica **só no metadata**, não entra em `creditos.credito_originario`
+  e não muda o status (a OAB em comum continua sem ligar). Sinais (`sinais_do_candidato`): credor no polo ativo →
+  `NOME_CREDOR` (o DJEN do candidato não traz CPF); ente conferido no passivo → `ENTE_PASSIVO`; o candidato cita o
+  precatório ou é citado no DJEN dele → `CITA_PRECATORIO`; valor → `VALOR`; OAB em comum → `ADVOGADO_EM_COMUM`;
+  cumprimento/execução → `CLASSE_CUMPRIMENTO`; CNJ de ano anterior → `ANO_ANTERIOR`. Candidato sem o credor no polo
+  ativo não entra (mínimo da escala).
 
 ## Resultado das simulações (07/10/2026, ROLLBACK, banco conferido igual antes e depois)
 
@@ -133,5 +141,8 @@ conferidos no DJEN do próprio candidato:
 
 ## Outros scripts da pasta
 
+Scripts de uma vez só, já rodados e removidos do repositório:
+- `recalcular_originario_provavel.py` (08/10/2026): grava `metadata.originario_provavel` nos créditos que o robô
+  processou antes. Em 08/10/2026 o robô tinha 1 crédito processado, sem candidato: nada a gravar.
 - `corrigir_legado_TJPI.py` (05/10/2026): ligou o credor que o RPA antigo leu do PJe com o papel errado (requerente
   gravado como ADVOGADO, com o nome emendado aos advogados e o CPF certo). Não consulta fonte nenhuma.
