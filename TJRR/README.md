@@ -30,6 +30,10 @@ python TJRR/captcha_TJRR.py muraki                            # só testa o capt
   reserva sem dono é solta na partida e a cada 30 min.
 - **Arquivos de desfazer:** só com `--com-desfazer`; o padrão é não escrever (`--sem-desfazer`, que os ciclos do modo
   5 passam, continua aceito).
+- **API de CPF no robô (08/10/2026, como no TJPI e no TJRJ):** credor só com nome (fora os honorários) -> o robô
+  consulta a API pelo nome (`utils/cpf_robo.py`; regra, gate `CPF_API/liberacao.json` e cache do
+  `CPF_API/completar_cpf.py`). Aceito: credor ligado com o CPF e status `SUCESSO_API_TERCEIRO`; senão fica
+  `SUCESSO_SEM_CPF` com `metadata.cpf_api` (o completar não consulta de novo). `--sem-cpf-api` desliga.
 - **Conexão parada:** o Postgres derruba sessão parada há mais de 15 min; depois da espera pelos adiados o robô abre
   conexões novas, e a leitura do crédito tenta de novo uma vez com conexão nova.
 - **Chrome:** o robô abre o Chrome instalado (perfis `TJRR/.chrome-profile-muraki-tjrr` e
@@ -74,6 +78,23 @@ O Playwright síncrono só funciona na thread que o criou: os dois Chromes vivem
   (10 por página). Não mostra CPF. O processo do precatório dá 404 (sigiloso).
 - **DJEN:** nome do credor na "Lista de distribuição" do precatório (o TJRR só publica no DJEN de 2025 em diante) e o
   texto do originário (valor, nº do precatório) para desempatar.
+  - Desde 09/10/2026 o DJEN do precatório é lido **em todo lead** (1 chamada, ≥ 1,2 s, saída direta, sem os
+    PROXY_0x), também em `FORA_DO_MURAKI` e `CREDOR_SEM_NOME`. Antes era lido só com valor 0 no Murakî, e o robô
+    ligava como ADVOGADO todo advogado de RR intimado, inclusive os procuradores do Estado ("Z SANDRO (SUB) …",
+    "JONES POLO PASSIVO EXECUÇÕES", "GABRIEL SUBSTITUTO", Paulo Estevão Sales Cruz, Luciana Briglia).
+  - **Advogados:** só os do credor (`utils/advogados_djen.py`: lado do credor, sem nome de órgão) **e** com o nome
+    na lista de advogados do SGP (`guarda_da_lista`, regra `mesmo_advogado`; o SEM_LADO que bate com o SGP entra,
+    porque a publicação do precatório é sigilosa e quase nunca tem rótulo). Sem a lista do SGP (precatório de 2026
+    ainda sem ID SGP), o módulo sozinho aceitaria o procurador pela pista SO_CREDOR (a "Lista de distribuição" só tem
+    o credor e o Estado): então fica só o advogado de credor conhecido, com o nome na lista do SGP de ≥ 2 créditos do
+    TJRR (`MIN_CREDITOS_ADV_CONHECIDO`; procurador quase nunca está, advogado particular está em dezenas). Vão para o crédito com `ligar_advogados` (pela OAB); `metadata.motor.djen` guarda `advogados`,
+    `advogados_fora` e a marca `advogados_completado` (via ROBO).
+  - **Credor só pelo nome:** sem credor ainda (`FORA_DO_MURAKI`, ou CPF do Murakî sem nome = `CREDOR_SEM_NOME`), o
+    nome da "Lista de distribuição" entra quando é um só (pessoa comum), `fonte_nome = DJEN_LISTA`. Só o nome: o CPF
+    continua vindo do Murakî, da API de CPF do robô, ou fica no metadata.
+  - Os já processados foram acertados pelo `utils/completar_advogados_djen.py` e pelo
+    `limpar_advogados_procuradores.py` (09 e 13/10/2026; scripts de uma vez só, removidos do repositório). Desde 13/10 o advogado que vem do
+    originário no Projudi passa pelo mesmo filtro de órgão (`RE_NOME_DE_ORGAO` e o "Z " do começo).
 
 ## Esteira
 
@@ -89,6 +110,15 @@ Faixas, na ordem da fila (dentro de cada uma: prioridade, ordem cronológica da 
 2. **HONORARIOS** (a lista só tem a linha "Honorários Advocatícios") — decisão do usuário de 02/10/2026, igual ao
    TJRJ: o advogado/sociedade fica **só como ADVOGADO** (com o documento do Murakî), sem CREDOR;
    `SUCESSO_INCOMPLETO` "SUCESSO_SEM_CPF … regra=HONORARIOS_ADVOGADO".
+   - **Advogado pessoa física que é o próprio credor** (decisão do usuário de 08/10/2026, a regra do TJMA): CREDOR
+     com o CPF do Murakî e ADVOGADO, `SUCESSO_PROCESSO_CREDITO` "CREDOR_ADVOGADO: … regra=HONORARIOS_ADVOGADO". Só
+     quando o CPF é dele: Murakî com **valor > 0** (valor 0 é a linha de honorários dentro do precatório de um
+     cliente: o credor é outro) e a pessoa do banco com esse CPF **tem OAB** e o nome de um advogado do precatório no
+     SGP. Na base de 08/10/2026 nenhum caso passou: nessa faixa o Murakî dá, com valor > 0, o CPF do **cliente** (47
+     créditos, 34 CPFs diferentes para o mesmo advogado), e com o CPF do advogado o valor é 0 (10 créditos). O robô
+     antigo criou pessoas com o nome do advogado e o CPF do cliente (sem OAB). O `religar_honorarios.py`
+     (script de uma vez só, já rodado e removido do repositório) aplicou a mesma conferência aos já gravados: em 08/10/2026,
+     0 de 282 (124 sociedades, 100 sem CPF, 43 CPF sem OAB no banco, 10 valor 0, 5 já com credor).
 3. **PAGO** — nome do SGP; Projudi pelo nome (ou pelo CPF do CONTATOS com o mesmo nome: se o Projudi mostra essa
    pessoa nos processos do CPF, o CPF vale como confirmado). CPF achado só por nome no banco é **candidato** (vai
    para o metadata, nunca é ligado; decisão do usuário).
@@ -104,6 +134,18 @@ precatório entre 15 dias depois e 180 dias antes da apresentação (2), vara = 
 mais forte com força ≥ 2 ou o único candidato. Empate: procura a expedição nas movimentações antigas dos candidatos
 (busca binária pelas páginas até a data da apresentação; o detalhe só traz as 20 mais novas) e depois o DJEN.
 
+**Originário provável (08/10/2026):** quando não confirma (empate ou sem evidência suficiente), o robô grava
+`metadata.originario_provavel` com a escala comum de `utils/originario_provavel.py`: o mais provável, a confiança
+(`alta`/`media`/`baixa`), os pontos, a margem para o segundo e até 5 candidatos com os sinais. Decisão do usuário: fica
+**só no metadata**; não entra em `creditos.credito_originario` e não muda o status. Tradução para os sinais
+(`sinais_do_candidato`): nº do precatório no DJEN → `CITA_PRECATORIO`; valor → `VALOR`; expedição perto →
+`EXPEDICAO_PERTO`; vara de origem → `VARA_FAZENDA`; processos da busca pelo CPF confirmado → `CPF_CREDOR` (senão
+`NOME_CREDOR`); ente da lista conferido no passivo → `ENTE_PASSIVO`; advogado do credor no processo que também está
+no precatório (nome no SGP ou OAB no DJEN; não entra na força) → `ADVOGADO_EM_COMUM`; cumprimento/execução →
+`CLASSE_CUMPRIMENTO`; CNJ de ano anterior ao do precatório → `ANO_ANTERIOR`. Os créditos processados antes disso
+foram acertados pelo `recalcular_originario_provavel.py` (script de uma vez só, já rodado e removido do repositório). Em 08/10/2026: 808 créditos `SUCESSO_ANALISAR` ganharam o provável
+(322 média, 486 baixa, nenhum alto: os guardados antes não têm o advogado em comum).
+
 **Status:**
 
 | Situação | Status |
@@ -114,6 +156,7 @@ mais forte com força ≥ 2 ou o único candidato. Empate: procura a expedição
 | CPF sem nome (coletiva) | `SUCESSO_ANALISAR CREDOR_SEM_NOME` (CPF e processos no metadata) |
 | Só o nome (pagos, DJEN) | `SUCESSO_INCOMPLETO SUCESSO_SEM_CPF` (com ou sem originário) |
 | Crédito só de honorários | `SUCESSO_INCOMPLETO SUCESSO_SEM_CPF … regra=HONORARIOS_ADVOGADO` |
+| Só de honorários, advogado pessoa física credor (valor > 0, CPF de pessoa com OAB e nome do SGP) | `SUCESSO_PROCESSO_CREDITO CREDOR_ADVOGADO … regra=HONORARIOS_ADVOGADO` (CREDOR e ADVOGADO) |
 | Honorários sem candidato; outra situação sem credor confirmado (1ª e 2ª vez) | volta para a fila em 60 dias (`CREDOR_NAO_IDENTIFICADO` / `FORA_DO_MURAKI … [sem_credor=N]`) |
 | Idem, 3ª vez | `FALHA SEM_CREDOR` |
 | Cancelado/indeferido; ente público | `FALHA` |
@@ -122,7 +165,7 @@ mais forte com força ≥ 2 ou o único candidato. Empate: procura a expedição
 `SUCESSO_ANALISAR` (lá ele nunca voltaria: o `fila_credor_repescar` só reabre FALHA). Volta para a fila em 60 dias — a
 situação no SGP/Murakî e as publicações mudam — e, na 3ª vez, vira `FALHA SEM_CREDOR`. O contador vai no motivo da
 fila (`[sem_credor=N]`) e sobrevive a erro passageiro. Os 414 que já estavam em `SUCESSO_ANALISAR` com esses motivos
-foram devolvidos à fila por `TJRR/reabrir_sem_credor.py` (contam como a 1ª vez).
+foram devolvidos à fila pelo `reabrir_sem_credor.py` (script de uma vez só, já rodado e removido do repositório) (contam como a 1ª vez).
 
 ## Gravação
 

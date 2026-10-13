@@ -28,6 +28,9 @@ O originário já vem da lista do TJRJ (lista_item.metadata.NumeroProcOriginario
    decisão do usuário de 07/10/2026; regra, gate e cache do CPF_API/completar_cpf.py): aceito -> SUCESSO_API_TERCEIRO
    com o credor ligado (a capa continua só com o que a fonte mostrou); senão fica SUCESSO_SEM_CPF com
    metadata.cpf_api (o completar_cpf.py não consulta de novo).
+   Crédito que já tem CREDOR com CPF/CNPJ (relação do DJERJ, API de CPF, rodada anterior) e esse credor está entre os
+   autores do originário: CREDOR_POLO_ATIVO_SEM_VINCULO e SUCESSO_SEM_CPF viram SUCESSO_PROCESSO_ORIGINARIO com
+   'CREDOR_JA_LIGADO: ...' no motivo (reprocessar não rebaixa o status). Cessão/herdeiro continua SUCESSO_ANALISAR.
    A capa só acrescenta (partes do banco + as novas); na ação coletiva vai só o credor confirmado, o polo passivo e o
    advogado daquele precatório (página do precatório no eJUD), para o recálculo do banco não ligar os outros autores
    e advogados aos precatórios dos outros credores. Legado como o TJMA: capa antiga (originarios.*) e status nas filas
@@ -44,7 +47,8 @@ desfazer_legado_*.sql, desfazer_fila_*.sql e o log em saida/logs.
 Uso:
     python fetch_TJRJ.py --simulacao            # 20 créditos: faz tudo e desfaz no banco (ROLLBACK); não mexe na fila
     python fetch_TJRJ.py --simulacao --creditos 1160917,1192966   # só esses créditos, desfazendo no fim
-    python fetch_TJRJ.py                        # processa a fila do TJRJ até acabar (Ctrl+C para parar)
+    python fetch_TJRJ.py                        # processa a fila do TJRJ até acabar e, no fim, passa a API de CPF
+                                                # no estoque antigo de credores só com nome (Ctrl+C para parar)
     python fetch_TJRJ.py --limite 50            # para depois de 50 créditos
     python fetch_TJRJ.py --workers 4            # workers (threads) raspando ao mesmo tempo (padrão 6)
     python fetch_TJRJ.py --chromes 0            # sem o eJUD 2º grau (os leads do 2º grau ficam para o RPA)
@@ -88,6 +92,7 @@ from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
 from utils.legado import (limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
                           reservar_filas_mensais, soltar_filas_mensais)
+from utils.cobertura import logar_cobertura  # noqa: E402
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 from utils.workers import matar_chrome_do_perfil  # noqa: E402
@@ -109,6 +114,13 @@ FILAS_MENSAIS = []                     # filas do RPA antigo com permissão de U
 WORKERS = 6                            # workers (threads deste processo) raspando ao mesmo tempo (--workers)
 TETO_CREDITO = 5 * 60                  # s por crédito; passou disso, volta para a fila
 ADIAMENTO = "30 minutes"               # erro passageiro
+# processo não encontrado: repete a busca uma vez na hora (o site às vezes responde vazio) e, se continuar vazio, volta
+# para a fila em ADIAMENTO_NAO_ENCONTRADO; só na MAX_TENTATIVAS_NAO_ENCONTRADO-ésima vez grava FALHA. O contador vai
+# no motivo da fila ('[nao_encontrado=N]'), como o '[sem_credor=N]' do TJDF
+ESPERA_REPETIR_BUSCA = 5
+ADIAMENTO_NAO_ENCONTRADO = "7 days"
+MAX_TENTATIVAS_NAO_ENCONTRADO = 3
+RE_CONTADOR_NAO_ENCONTRADO = re.compile(r"\[nao_encontrado=(\d+)\]")
 REORDENAR_A_CADA = 30 * 60             # s entre remontagens da ordem da fila (entram os adiados que venceram)
 CHECAR_CAPTCHA_A_CADA = 30 * 60        # s entre conferências do reCAPTCHA do DCP
 MAX_FALHAS_SEGUIDAS = 12               # falhas técnicas seguidas que param o robô
@@ -216,6 +228,8 @@ SEMELHANCA_MESMA_PESSOA = 0.9          # nomes com grafia próxima (SOUSA x SOUZ
 PAPEL_LEGADO = {"ATIVO": "REQUERENTE", "PASSIVO": "REQUERIDO"}    # como o RPA grava a capa antiga
 POLO_BRUTO = {"ATIVO": "AUTOR", "PASSIVO": "REU"}
 STATUS_COM_CREDOR = ("SUCESSO_PROCESSO_ORIGINARIO", "SUCESSO_INCOMPLETO")
+# a fonte não decidiu o credor (ou não deu o CPF): se o crédito já tem o credor com CPF entre os autores, mantém sucesso
+MOTIVOS_SEM_CREDOR_DECIDIDO = ("CREDOR_POLO_ATIVO_SEM_VINCULO", "SUCESSO_SEM_CPF")
 # sistema do originário -> creditos.sistema_processual (o DCP não tem código lá: não grava sistema)
 SISTEMA_BANCO = {"PJE": "PJE", "EPROC": "EPROC"}
 
@@ -1131,6 +1145,14 @@ def credores_do_credito(cur, credito_id):
                     WHERE x.credito_id = %s""", (credito_id,))
     return set(cur.fetchall())
 
+
+def credor_ja_ligado(cur, credito_id, nomes):
+    """Nome do CREDOR com CPF/CNPJ que o crédito já tem e que é um dos `nomes` (autores do originário), ou None."""
+    cur.execute("""SELECT p.nome FROM creditos.credito_credor x
+                     JOIN creditos.pessoa p ON p.id = x.pessoa_id
+                    WHERE x.credito_id = %s AND x.papel_id = 1 AND p.documento IS NOT NULL""", (credito_id,))
+    return next((nome for (nome,) in cur.fetchall() if any(mesma_pessoa(nome, a) for a in nomes)), None)
+
 # =============================================================================== decisão (só lê: DCP, PJe, eJUD, portal)
 
 
@@ -1723,6 +1745,12 @@ def gravar(cur, lead, r, filas, status_legado, bk):
     if vinculo_api:
         r["status"], r["motivo"], detalhe = cpf_robo.motivo_e_detalhe(
             res_api, formatar_cnj(r["originario"]) if r["originario"] else None, r["motivo"], detalhe, SOFTWARE)
+    elif r["motivo"].startswith(MOTIVOS_SEM_CREDOR_DECIDIDO):
+        # a fonte não decidiu, mas o crédito já tem o credor com CPF e ele é autor do originário: não rebaixa
+        ja = credor_ja_ligado(cur, cid, r["autores"] + ([credor["nome"]] if credor else []))
+        if ja:
+            r.update(status="SUCESSO_PROCESSO_ORIGINARIO", motivo=f"CREDOR_JA_LIGADO: {r['motivo']}")
+            detalhe["credor_ja_ligado"] = ja
     registrar_metadata(cur, lead, r)
     legado += atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk)
     depois = credores_do_credito(cur, cid)
@@ -2056,6 +2084,10 @@ def proximo_credito(rod):
     return credito_id
 
 
+def nao_encontrado(r):
+    return r["status"] == "FALHA" and (r.get("motivo") or "").startswith("PROCESSO_NAO_ENCONTRADO")
+
+
 def processar_credito(rod, credito_id, n):
     """(Numa thread) Lê o crédito e decide o credor (DCP/PJe/eJUD/portal), sem gravar nada.
     Devolve {tipo: LOTE, linha, lead, r}, {tipo: ADIAR, ...} ou {tipo: IGNORAR, ...}."""
@@ -2068,6 +2100,24 @@ def processar_credito(rod, credito_id, n):
         linha.update(precatorio=lead["precatorio"], faixa=lead["faixa"], ente=lead["ente"],
                      originario=formatar_cnj(lead["originario"]) if lead["originario"] else "")
         r = processar(lead, http, pje, rod.ejud, rod.cache, inicio)
+        if nao_encontrado(r):
+            # repete uma vez antes de aceitar o vazio (o DCP/PJe/eJUD às vezes responde sem nada), sem o cache
+            time.sleep(ESPERA_REPETIR_BUSCA)
+            rod.cache.por(lead["originario"], None)
+            r = processar(lead, http, pje, rod.ejud, rod.cache, inicio)
+        if nao_encontrado(r):
+            with con.cursor() as cur:
+                cur.execute("SELECT motivo_detalhe FROM creditos.coleta_credor WHERE credito_id = %s", (credito_id,))
+                m = RE_CONTADOR_NAO_ENCONTRADO.search((cur.fetchone() or [""])[0] or "")
+            vez = (int(m.group(1)) if m else 0) + 1
+            if vez < MAX_TENTATIVAS_NAO_ENCONTRADO:
+                motivo = f"{r['motivo']}"[:1900] + f" [nao_encontrado={vez}]"
+                linha.update(resultado="ADIADO", motivo=motivo, segundos=round(time.time() - inicio))
+                log.info(f"[{n}] {credito_id} {lead['precatorio']} -> processo não encontrado ({vez}ª vez): volta "
+                         f"em {ADIAMENTO_NAO_ENCONTRADO}")
+                return {"tipo": "ADIAR", "credito_id": credito_id, "motivo": motivo, "linha": linha,
+                        "tecnico": False, "intervalo": ADIAMENTO_NAO_ENCONTRADO}
+            r["motivo"] = f"{r['motivo']}"[:1900] + f" [nao_encontrado={vez}]"
         c = r["credor"]
         if (r["status"] == "SUCESSO_INCOMPLETO" and r["regra"] != "HONORARIOS_ADVOGADO" and c
                 and not c["documento"]):
@@ -2113,11 +2163,11 @@ def tratar(rod, item, pendentes):
         if item["tipo"] == "IGNORAR":
             devolver_ao_rpa(rod.con, item["credito_id"])    # fora do escopo: volta para o RPA
         else:
-            devolver(rod.con, item["credito_id"], item["motivo"], ADIAMENTO)
+            devolver(rod.con, item["credito_id"], item["motivo"], item.get("intervalo", ADIAMENTO))
     anexar_csv(rod.arq_credito, COLUNAS, [item["linha"]])
     rod.resultados[item["linha"]["resultado"]] += 1
-    if item["tipo"] == "IGNORAR":
-        return
+    if item["tipo"] == "IGNORAR" or not item.get("tecnico", True):
+        return                                          # não encontrado adiado não é falha técnica: não conta
     if not item["motivo"].startswith("CAPTCHA_EJUD"):   # recusa do reCAPTCHA é freio previsto, não pane: não para
         rod.falhas_seguidas += 1
     log.warning(f"{item['credito_id']} -> ADIADO: {item['motivo']}")
@@ -2147,6 +2197,7 @@ def encerrar(rod, pendentes, inicio):
     log.info(f"{rod.modo}: {rod.n} crédito(s) em {rod.n_lote} lote(s), {minutos:.1f} min "
              f"({rod.n / minutos:.1f}/min) | " + ", ".join(f"{k}: {v}" for k, v in rod.resultados.most_common()))
     log.info(f"API de CPF: {rod.cpf_api.chamadas_api} chamada(s) | CSV: {rod.arq_credito}")
+    logar_cobertura(log, "TJRJ", TRIBUNAL_TJRJ)
 
 
 def ler_argumentos():
@@ -2166,6 +2217,9 @@ def ler_argumentos():
                     help="só na simulação: ids de crédito separados por vírgula (no lugar dos primeiros da fila)")
     ap.add_argument("--sem-cpf-api", action="store_true",
                     help="não consulta a API de CPF (o credor sem CPF fica para o CPF_API/completar_cpf.py)")
+    ap.add_argument("--sem-estoque-cpf", action="store_true",
+                    help="no fim da fila, não passa a API de CPF no estoque antigo (o ciclo do modo 5 do RPA passa: "
+                         "ele já roda o completar_cpf.py à parte)")
     ap.add_argument("--com-desfazer", action="store_true",
                     help="escreve os arquivos de desfazer (desfazer_*.sql e backup .csv); o padrão é não escrever")
     ap.add_argument("--sem-desfazer", action="store_true",
@@ -2190,6 +2244,7 @@ def main():
     rod = Rodada(args.simulacao, args.limite, max(1, args.workers), args.ritmo, creditos, max(0, args.chromes),
                  usar_cpf_api=not args.sem_cpf_api)
     pendentes, em_voo = [], {}
+    interrompido = False
     executor = ThreadPoolExecutor(max_workers=rod.workers, thread_name_prefix="tjrj")
     try:
         while True:
@@ -2218,6 +2273,7 @@ def main():
             if len(pendentes) >= LOTE:
                 descarregar(rod, pendentes)
     except KeyboardInterrupt:
+        interrompido = True
         rod.parar.set()
         if not rod.simulacao:
             for credito_id in em_voo.values():
@@ -2230,6 +2286,29 @@ def main():
         rod.parar.set()
         executor.shutdown(wait=True, cancel_futures=True)
         encerrar(rod, pendentes, inicio)
+    # rodada cheia (sem --limite, --creditos, --simulacao, --sem-cpf-api ou --sem-estoque-cpf) que esvaziou a fila: o
+    # robô passa a API de CPF também no estoque antigo (credor só com nome gravado antes da API entrar no robô)
+    if not interrompido and rod.fila_vazia and not (args.simulacao or args.limite or creditos or args.sem_cpf_api
+                                                    or args.sem_estoque_cpf):
+        completar_cpf_restante()
+
+
+def completar_cpf_restante():
+    """API de CPF nos créditos do TJRJ que ainda estão só com nome (o mesmo CPF_API/completar_cpf.py, chamado daqui).
+    Ritmo de 30 consultas/min (metade do limite do token, que é dividido com a frota); Ctrl+C para no meio sem perder
+    o que já foi gravado, e a próxima rodada continua de onde parou (quem já foi tentado fica marcado)."""
+    script = AQUI.parent / "CPF_API" / "completar_cpf.py"
+    cmd = [sys.executable, str(script), "--tribunal", "TJRJ", "--sem-espera", "--intervalo", "2"]
+    if not GERAR_DESFAZER:
+        cmd.append("--sem-desfazer")
+    log.info("fila do TJRJ vazia: passando a API de CPF no estoque de credores só com nome (Ctrl+C para parar)")
+    try:
+        rc = subprocess.run(cmd, cwd=str(AQUI.parent)).returncode
+    except KeyboardInterrupt:
+        log.warning("API de CPF interrompida: o que já foi gravado fica; a próxima rodada continua de onde parou")
+        return
+    if rc:
+        log.warning(f"API de CPF terminou com código {rc} (2 = token, 3 = gravação não liberada pela medição)")
 
 
 if __name__ == "__main__":

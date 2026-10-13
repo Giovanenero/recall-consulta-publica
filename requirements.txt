@@ -8,4 +8,5 @@ opencv-python-headless==5.0.0.93  # captcha Tencent do PJe (TJBA)
 numpy==2.5.3                   # imagens do captcha (TJBA)
 scrapling==0.4.15              # texto do detalhe do PJe (TJRN)
 pdfplumber==0.11.10            # PDFs de precatórios do hotsite (TJMA)
-# patchright                   # opcional no TJBA e no TJRJ (eJUD 2º grau): se instalado, é usado no lugar do playwright; obrigatório só para utils/cloudflare.py
+ddddocr==1.6.1                 # OCR do captcha de imagem do Jurisconsult (TJMA, fallback dos antigos; precisa também do patchright)
+# patchright                   # opcional no TJBA e no TJRJ (eJUD 2º grau): se instalado, é usado no lugar do playwright; obrigatório para utils/cloudflare.py e o Jurisconsult do TJMA

@@ -9,9 +9,11 @@ da Recall (schema `creditos` e tabelas legadas). Cada tribunal tem uma pasta com
 | `TJAL/` | `fetch_TJAL.py` | API do SAPRE + e-SAJ (1º e 2º grau) | Sim | [TJAL/README.md](TJAL/README.md) |
 | `TJBA/` | `fetch_TJBA.py` | API do DJEN + PJe 1º grau (captcha Tencent) | Sim | [TJBA/README.md](TJBA/README.md) |
 | `TJRN/` | `esteira_TJRN.py` + `fetch_TJRN.py` | PJe 1º grau (Akamai + reCAPTCHA) | **Não** (só CSV) | [TJRN/README.md](TJRN/README.md) |
-| `TJMA/` | `fetch_TJMA.py` | — | — | arquivo vazio (ainda não começou) |
+| `TJMA/` | `fetch_TJMA.py` | API do DJEN (credor, advogados e CNJs citados) + PJe 1º grau público (HTTP, CPF do polo ativo), sem A3 e sem login | Sim | [TJMA/README.md](TJMA/README.md) |
 | `TJRJ/` | `fetch_TJRJ.py` | API da consulta processual (DCP) + PJe 1º grau + eJUD 2º grau (Chrome por CDP) + portal de precatórios, sem A3 | Sim | [TJRJ/README.md](TJRJ/README.md) |
 | `TJMT/` | `fetch_TJMT.py` | API do DJEN (iniciais do credor e advogados) + API da consulta processual do TJMT (processos do advogado, com CPF), sem A3 | Sim | [TJMT/README.md](TJMT/README.md) |
+| `TJPI/` | `fetch_TJPI.py` | API do DJEN (cabeçalho do precatório: requerentes e requerido; originário confirmado no DJEN do candidato), sem A3 e sem login | Sim | [TJPI/README.md](TJPI/README.md) |
+| `CPF_API/` | `completar_cpf.py` | API interna de CPFs (nome → CPF), nos créditos em que os robôs acharam o credor sem CPF (TJRJ, TJBA, TJDFT, TJRR, TJMT, TJMA, TJPI); mede o acerto antes de gravar | Sim (`SUCESSO_API_TERCEIRO`) | [CPF_API/README.md](CPF_API/README.md) |
 | `utils/` | código comum | — | — | abaixo |
 
 `utils/cloudflare.py` é um teste à parte (Turnstile do eproc da JFRJ) e não é usado pelos robôs.
@@ -23,8 +25,9 @@ da Recall (schema `creditos` e tabelas legadas). Cada tribunal tem uma pasta com
 - **Simulação x gravação**: TJAL e TJBA têm `--simulacao`, que faz tudo (inclusive as escritas no banco) e dá
   `ROLLBACK` no fim — use sempre antes de uma gravação real. Sem a flag, o robô grava (`COMMIT`).
 - **Credenciais**: `.env` na raiz (modelo sem valores em `.env.shared`): `PG_HOST`, `PG_PORT`, `PG_DATABASE`,
-  `PG_USER`, `PG_PASSWORD`; `LOTE_GRAVACAO_TJMA` (TJMA); `LOTE_GRAVACAO_TJRJ` (TJRJ); `LOTE_GRAVACAO_TJMT` (TJMT). `PROXY_01..05` (`host:porta:usuário:senha`, saindo pelo Brasil): saídas extras para o
+  `PG_USER`, `PG_PASSWORD`; `LOTE_GRAVACAO_TJRR` (TJRR) e `LOTE_GRAVACAO_TJDF` (TJDF). No TJMA, TJMT, TJRJ e TJPI o lote de gravação é a constante `LOTE` no início do robô. `PROXY_01..05` (`host:porta:usuário:senha`, saindo pelo Brasil): saídas extras para o
   DJEN no TJMA (`--proxies`) e nos workers 2 em diante do TJBA (`--workers N` num terminal só, ou `--worker N`).
+  `CPF_API_URL` e `CPF_API_TOKEN`: API interna de CPFs (`utils/cpf_api.py`, usada pelo `CPF_API/completar_cpf.py`).
 - **Log padrão** (`utils/log.py`): mesma linha no terminal e em `<PASTA>/saida/logs/<robo>_AAAAMMDD.log`:
   ```
   2026-09-28 09:48:47 | INFO    | fetch_TJBA | [5] 921778 8045268-52.2025.8.05.0000 -> SUCESSO_PARTES_SEM_VALOR ...
@@ -46,6 +49,9 @@ da Recall (schema `creditos` e tabelas legadas). Cada tribunal tem uma pasta com
 | `texto.py` | `so_digitos`, `formatar_cnj`, `documento_valido` (dígito verificador de CPF/CNPJ) |
 | `arquivos.py` | `gravar_csv` (sobrescreve) e `anexar_csv` (acrescenta; cabeçalho só em arquivo novo; arquivo que já existe segue o cabeçalho dele) |
 | `workers.py` | vários workers num terminal: `supervisionar` (`--workers N`), `travar_worker` (um processo por número), `ParadaSuave` (Ctrl+C vira pedido de parada) e `matar_chrome_do_perfil` (Chrome órfão de um perfil) |
+| `cpf_api.py` | API interna de CPFs: `Cliente.cpf_unico(nome, nascimento)` com a regra estrita (nome idêntico, um só CPF no país, nascimento quando houver), `Cache` por nome, `ErroApi`/`ErroToken` (erro nunca vira "não achou"); `python -m utils.cpf_api --nome X` para sondar |
+| `cobertura.py` | medição de cobertura pedida pelo artifact (só leitura): % com credor com CPF/CNPJ, originário, os dois, só provável e advogado com OAB, no total, nos não pagos e por ano orçamentário. `logar_cobertura` gera a linha `[cobertura]` no fim da rodada dos 8 robôs do modo 5; `python utils/cobertura.py [--tribunal TJMA ...]` mostra o resumo e grava o CSV por ano em `saida/` |
+| `legado.py` | `Backup` (desfazer em 3 níveis: crédito, lote, commit), `atualizar_filas_mensais` e `atualizar_tabela_antiga` (status no RPA antigo sem rebaixar o que outro robô melhorou): cópia parametrizada das funções dos robôs, para scripts que não são robô |
 
 A comparação de nomes (`normal`, `chave`, `mesmo_nome`...) fica em cada robô: cada tribunal escreve os nomes de um
 jeito e as regras não são iguais.

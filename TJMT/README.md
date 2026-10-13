@@ -107,11 +107,73 @@ menos de 60 anos no envio sai.
 | 1 pessoa só pelas iniciais, sem evidência | `SUCESSO_ANALISAR` (`CREDOR_SO_POR_INICIAIS: …`) | só o metadata (`candidato_analisar`: nome, documento, originário) |
 | várias pessoas sem desempate | `SUCESSO_ANALISAR` (`CANDIDATOS_POR_INICIAIS: …`) | só o metadata (candidatos) |
 | credor é ente público | `FALHA` (`REQTE_ORGAO_PUBLICO`) | metadata |
-| nenhum candidato / sem advogado no DJEN | `FALHA` (`PROCESSO_NAO_ENCONTRADO`) | metadata |
+| nenhum candidato / sem advogado no DJEN (1ª e 2ª vez) | repete a busca na hora sem cache; vazio de novo, volta para a fila em 7 dias (`PROCESSO_NAO_ENCONTRADO: … [nao_encontrado=N]`) | nada |
+| nenhum candidato / sem advogado no DJEN (3ª vez) | `FALHA` (`PROCESSO_NAO_ENCONTRADO … [nao_encontrado=3]`) | metadata |
 | sem publicação no DJEN | volta para a fila em 15 dias (`AINDA_SEM_PUBLICACAO`) | nada |
+
+### Não encontrado (desde 09/10/2026, regra do TJMA/TJRJ)
+`PROCESSO_NAO_ENCONTRADO` não é final de cara: o robô repete a busca uma vez na hora (sem o cache das listas dos
+advogados e do DJEN dos candidatos); se continuar vazio, o crédito volta para a fila em 7 dias
+(`ADIAMENTO_NAO_ENCONTRADO`) com o contador `[nao_encontrado=N]` no motivo; só na 3ª vez
+(`MAX_TENTATIVAS_NAO_ENCONTRADO`) grava `FALHA`. Não conta como falha técnica (não para a rodada).
+Os `FALHA PROCESSO_NAO_ENCONTRADO` gravados antes (sem credor ligado) voltaram para a fila em 09/10/2026 pelo
+`reabrir_nao_encontrado.py` (script de uma vez só, já rodado e removido do repositório); desfazer em `TJMT/saida/desfazer_reabrir_nao_encontrado_<data>.sql`.
+
+Consulta pelo nº do precatório (hellsgate `numeroUnico`, com e sem `ExibirArquivados`), teste de 09/10/2026 em 20
+`FALHA PROCESSO_NAO_ENCONTRADO` + 20 `CREDOR_SO_POR_INICIAIS`: só os 2 precatórios antigos (00…/01…, sistema legado)
+vieram (1 com CPF do credor); os 38 do PJe (1…) não vêm (sigilosos). O robô já consulta o antigo pelo número
+(`do_legado`); não há etapa nova.
 
 Honorários (credor = sociedade de advogados, com CNPJ) seguem a mesma regra, com "(honorários: sociedade de
 advogados)" no motivo.
+
+### Honorários de advogado pessoa física (desde 08/10/2026)
+
+Regra do TJMA/TJDFT (`advogado_credor`): o polo A do DJEN tem **uma pessoa só**, em iniciais de **3 letras ou mais**
+que batem (com as partículas) com **exatamente um** advogado do precatório — ou o polo A só traz esse advogado com o
+nome inteiro (antes virava `SEM_BENEFICIARIO "polo ativo vazio"`). O credor é o próprio advogado:
+
+| Situação | Status | O que grava |
+|---|---|---|
+| com CPF (do processo dele na consulta, ou ao lado da OAB) | `SUCESSO_PROCESSO_CREDITO` (`CREDOR_ADVOGADO: … regra=HONORARIOS_ADVOGADO beneficiario=… oab=UFnnn`) | CREDOR com CPF + ADVOGADO com OAB |
+| idem, com evidência num processo dele | `SUCESSO_PROCESSO_ORIGINARIO` (mesmo motivo) | + originário e capa |
+| sem CPF | `SUCESSO_INCOMPLETO` (`SUCESSO_SEM_CPF: regra=HONORARIOS_ADVOGADO …`) | só ADVOGADO |
+
+Outra pessoa com as mesmas iniciais nos processos dos advogados (parente: GIULLEVERSON/GIULLIANO SILVA QUINTEIRO DE
+ALMEIDA, RONALDO/ROSIMEIRE QUEIROZ GARCIA) segue a decisão de sempre: com evidência, fica ela; sem, `SUCESSO_ANALISAR`.
+Precatório antigo (legado) e sociedade de advogados: como antes. Polo A com 2+ pessoas (cessionário, ex.: J. R. R. =
+JOSE RICARDO REZEK) não entra.
+
+Os já processados: `religar_honorarios.py` (script de uma vez só, já rodado e removido do repositório). Rodado em 08/10/2026: 611 créditos ganharam o advogado como CREDOR com CPF, 24 ficaram só com
+ADVOGADO (sem CPF), 273 que já tinham o advogado como credor ganharam só a marca; 55 de fora (46 outra pessoa com as
+iniciais, 9 CPFs conflitantes). Desfazer: `TJMT/saida/desfazer_religar_honorarios_20261008_155727.sql`.
+
+## Originário provável (desde 08/10/2026)
+
+Quando o originário **não** é confirmado (`SUCESSO_ANALISAR`: `CREDOR_SO_POR_INICIAIS`, `CANDIDATOS_POR_INICIAIS`,
+`CREDOR_CONFIRMADO_ORIGINARIO_AMBIGUO`), o robô grava `credito_fonte.metadata.originario_provavel`: o candidato mais
+provável, a **confiança** (alta/media/baixa), os pontos, a margem para o 2º e até 5 candidatos com os sinais. A escala
+é a comum dos robôs (`utils/originario_provavel.py`). **Decisão do usuário (08/10/2026): fica só no metadata**; não
+liga `credito_originario` e não muda o status. Com o originário confirmado a chave não existe (e sai, se existia).
+
+Os sinais saem do que o robô já guardou de cada candidato (`sinais_do_candidato`):
+
+| Sinal | No TJMT |
+|---|---|
+| `CPF_CREDOR` | documento da parte = CPF do credor confirmado pelo robô (originário ambíguo) ou de um credor que o banco já tinha de outra origem (CONTATOS, LEGADO) |
+| `NOME_CREDOR` / `INICIAIS_CREDOR` | casamento 3 (nome inteiro) / 1-2 (iniciais) |
+| `CITA_PRECATORIO`, `VALOR` | evidência `NUM_PRECATORIO` / `VALOR` no DJEN do candidato |
+| `EXPEDICAO_PERTO` | `ESPELHO_PERTO` ou `EXPEDICAO_PERTO` (as "longe" não contam) |
+| `ENTE_PASSIVO` | achado na pesquisa com o ente (fonte `ADVOGADO`, ou `NOME` com o ente) |
+| `ADVOGADO_EM_COMUM` | achado nos processos de um advogado do precatório (fonte `ADVOGADO`/`ADVOGADO_SEM_ENTE`) |
+| `CLASSE_CUMPRIMENTO`, `VARA_FAZENDA` | classe de cumprimento/execução; órgão da Fazenda Pública (o órgão é guardado desde 08/10/2026) |
+| `ANO_ANTERIOR` / `ANO_POSTERIOR` | ano do CNJ antes / depois do ano do precatório (o posterior sai) |
+
+Créditos processados antes de 08/10/2026: acertados pelo `recalcular_originario_provavel.py` (script de uma vez só, já rodado e removido do repositório). Validação de 08/10/2026 nos
+9.735 créditos com originário confirmado, escondendo a confirmação: com o credor certo e a evidência escondida
+(o caso do `CREDOR_CONFIRMADO_ORIGINARIO_AMBIGUO`), nos 4.918 com 2+ candidatos, **alta acerta 90,8%**, media 91,2%,
+baixa 39,2%; escondendo também o credor (o caso das iniciais), alta cai para 54,5% (112 casos, quase todos de
+precatório antigo achado pelo nome) — por isso "alta" sem o CPF do credor merece conferência.
 
 ## Gravação
 
@@ -131,15 +193,16 @@ advogados)" no motivo.
   raspagens antigas) e nenhum outro crédito ligado, o robô liga só o credor e **não** liga o originário nem grava a
   capa (motivo começa com `ORIGINARIO_COLETIVO_NAO_LIGADO`). Ligar faria o `registrar_capa` → `recalcular_credores_do_processo`
   ligar todos os autores como credores deste crédito (aconteceu em 5 créditos na carga de 01–02/10/2026: 42 vínculos,
-  desfeitos com `TJMT/corrigir_coletivos.py`, que também tira o precatório de `precatorio_relacionado` na capa antiga,
+  desfeitos com o `corrigir_coletivos.py` (script de uma vez só, já rodado e removido do repositório), que também tira o precatório de `precatorio_relacionado` na capa antiga,
   senão a sincronização do legado religa o originário).
 - **`creditos.processo.metadata`:** `capa_pje` no formato dos outros robôs (`fonte: consulta_tjmt`, `campos`:
   comarca, órgão, classe, data da distribuição, valor da causa, arquivado; `partes`) e `dataAjuizamento` (a data mais
   antiga do número: processo migrado para o PJe traz a da migração). Só acrescenta; backup do anterior.
 - **Legado:** a mesma capa recortada em `originarios.*` (origem `TJMT`) e o status nas filas mensais
   `listas_primarias.processos_unificados_AAAA_MM` (de 2026_08 em diante), com backup e `desfazer_legado_*.sql`.
-- **Metadata** (`credito_fonte` do software): decisão, candidatos com evidência, iniciais e advogados do DJEN, capa
-  do originário, situação da lista. O texto do DJEN não é guardado.
+- **Metadata** (`credito_fonte` do software): decisão, candidatos com evidência (e o órgão, desde 08/10/2026),
+  iniciais e advogados do DJEN, capa do originário, situação da lista e, sem originário confirmado,
+  `originario_provavel`. O texto do DJEN não é guardado.
 
 ## Saídas (`TJMT/saida/`, fora do git)
 

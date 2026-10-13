@@ -4,7 +4,8 @@ Completa o **CPF do credor pelo nome**, usando a API interna de CPFs (a mesma do
 créditos em que o robô do tribunal achou o credor na fonte pública mas **sem o CPF**. Não é robô de tribunal: só lê o
 que os robôs já gravaram.
 
-**Dentro dos robôs (07/10/2026):** o TJPI e o TJRJ consultam a API no próprio processamento, pelo `utils/cpf_robo.py`
+**Dentro dos robôs (07/10/2026; TJRR e TJDFT desde 08/10/2026):** o TJPI, o TJRJ, o TJRR e o TJDFT consultam a API no
+próprio processamento, pelo `utils/cpf_robo.py`
 (mesma regra, mesmo gate deste `liberacao.json`, mesmo cache `saida/cache_cpf_api.jsonl` e as mesmas marcas: status
 `SUCESSO_API_TERCEIRO`, tentativa com `detalhe.software = 'CPF_API_NOME'` e `detalhe.robo`, `credito_credor.tentativa_id`
 e `metadata.cpf_api`, com `via: "robo"`). O que o robô tenta e não aceita já fica com `metadata.cpf_api` e não volta
@@ -64,6 +65,10 @@ Opções:
 | `--refazer` | tenta de novo os créditos já tentados nesta versão da regra |
 | `--sem-espera` | grava sem os 10 s de aviso (é como o modo 5 chama) |
 | `--sem-desfazer` | não escreve `desfazer_*.sql`/`backup_*.csv` (o modo 5 passa sempre, como nos outros tribunais do modo 5) |
+| `--intervalo 2` | segundos entre chamadas à API (padrão 1,05 = ~57/min; 2 = 30/min, para deixar metade do limite do token para a frota) |
+
+**Ordem do estoque (08/10/2026):** os não pagos primeiro (`metadata.lista.faixa` do robô: `PAGO` no TJRR e `T3_PAGO`
+no TJRJ vão para o fim), cada grupo do maior valor para o menor. Assim `--limite N` pega os não pagos antes.
 | `--forcar` | grava sem a medição liberar (só por decisão do usuário) |
 
 **A gravação só roda para tribunal liberado** em `CPF_API/liberacao.json`. O `--medir` escreve esse arquivo, que vai

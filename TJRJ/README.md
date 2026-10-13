@@ -24,7 +24,12 @@ python TJRJ/fetch_TJRJ.py --simulacao                       # 20 créditos da or
 python TJRJ/fetch_TJRJ.py --simulacao --limite 100          # 100 créditos da ordem, tudo desfeito
 python TJRJ/fetch_TJRJ.py --simulacao --creditos 1160917,1192966   # só esses créditos, tudo desfeito
 python TJRJ/fetch_TJRJ.py --limite 50                       # modo real: para depois de 50 créditos
-python TJRJ/fetch_TJRJ.py                                   # modo real: processa a fila até acabar (Ctrl+C para)
+python TJRJ/fetch_TJRJ.py                                   # modo real: processa a fila até acabar e, no fim, passa a
+                                                            # API de CPF no estoque antigo de credores só com nome (Ctrl+C para)
+python TJRJ/fetch_TJRJ.py --sem-estoque-cpf                 # sem a etapa do estoque de CPF (o ciclo do modo 5 do RPA passa)
+python TJRJ/reabrir_nao_encontrado.py --aplicar             # devolve à fila os FALHA PROCESSO_NAO_ENCONTRADO antigos
+# Processo não encontrado (desde 09/10/2026): o robô repete a busca uma vez na hora; se continuar vazio, o crédito volta
+# para a fila em 7 dias e só na 3ª vez vira FALHA (contador '[nao_encontrado=N]' no motivo da fila).
 python TJRJ/fetch_TJRJ.py --workers 6 --ritmo 6             # padrão: 6 threads, até 6 req/s ao TJRJ no total
 python TJRJ/fetch_TJRJ.py --ritmo 12                        # mais rápido (12 req/s rodou 2 h sem freada em 01/10)
 python TJRJ/fetch_TJRJ.py --chromes 2                       # Chromes para o eJUD 2º grau (padrão 1; mais Chromes = mais recusa do reCAPTCHA)

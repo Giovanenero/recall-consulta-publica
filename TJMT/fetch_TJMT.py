@@ -21,6 +21,17 @@ A lista do TJMT não traz o beneficiário nem o originário, e o precatório é 
 5. Decide: 1 pessoa com evidência -> liga o originário e o credor (SUCESSO_PROCESSO_ORIGINARIO); 1 pessoa só pelas
    iniciais, sem evidência -> SUCESSO_ANALISAR (CREDOR_SO_POR_INICIAIS, regra do usuário de 01/10/2026; o candidato vai
    só para o metadata); várias pessoas -> a única com evidência, ou SUCESSO_ANALISAR (CANDIDATOS_POR_INICIAIS).
+   Originário não confirmado: metadata.originario_provavel com o mais provável dos candidatos e a confiança
+   (alta/media/baixa, escala comum de utils/originario_provavel.py; decisão do usuário de 08/10/2026: fica só no
+   metadata, não liga o originário nem muda o status). Os sinais saem do que o robô já viu (sinais_do_candidato).
+   Honorários de advogado pessoa física (advogado_credor, regra do TJMA/TJDFT, 08/10/2026): o polo A do DJEN tem uma
+   pessoa só e as iniciais dela (3 letras ou mais) batem com exatamente um advogado do precatório, ou o polo A só traz
+   esse advogado com o nome inteiro -> o credor é o próprio advogado: CREDOR com o CPF (do processo dele ou da
+   consulta, ao lado da OAB) e ADVOGADO com a OAB, SUCESSO_PROCESSO_CREDITO 'CREDOR_ADVOGADO: ...
+   regra=HONORARIOS_ADVOGADO beneficiario=... oab=UFnnn' (SUCESSO_PROCESSO_ORIGINARIO quando um processo dele tem
+   evidência); sem CPF, só ADVOGADO, SUCESSO_INCOMPLETO 'SUCESSO_SEM_CPF: regra=HONORARIOS_ADVOGADO ...'. Outra pessoa
+   com as mesmas iniciais nos processos dos advogados: segue a decisão de sempre (com evidência, fica ela; sem, vai
+   para análise). Sociedade de advogados: como antes. Os já processados foram acertados em 08/10/2026.
 6. Junta LOTE créditos processados e grava o lote numa transação só, cada crédito no seu SAVEPOINT (erro desfaz só
    ele): originário, credor (registrar_credor, corrigindo o CPF divergente do banco), capa recortada do originário
    (só o credor, o polo passivo e os advogados do precatório: o recálculo do banco ligaria todos os autores de uma
@@ -32,6 +43,11 @@ global que se ajusta sozinho (--ritmo). Os processos de cada advogado ficam em c
 muitos precatórios).
 
 Erro passageiro (DJEN/TJMT fora, timeout) devolve o crédito para a fila (fila_credor_adiar) na hora, nunca vira FALHA.
+PROCESSO_NAO_ENCONTRADO (09/10/2026, regra do TJMA/TJRJ): repete a busca na hora (sem cache) e, vazio de novo, volta
+para a fila em ADIAMENTO_NAO_ENCONTRADO com '[nao_encontrado=N]' no motivo; só a 3ª vez grava FALHA (não conta como
+falha técnica). Os FALHA antigos voltaram para a fila em 09/10/2026. A consulta pelo nº do precatório (hellsgate) só
+abre o precatório antigo (00…/01…, sistema legado, já usado em do_legado): os do PJe (1…) são sigilosos e não vêm
+(teste de 09/10/2026: 0 de 38).
 Ctrl+C devolve os créditos em andamento e grava o lote que já estava processado. O texto das publicações do DJEN não é
 gravado em lugar nenhum.
 
@@ -72,11 +88,12 @@ AQUI = Path(__file__).resolve().parent
 if str(AQUI.parent) not in sys.path:
     sys.path.insert(0, str(AQUI.parent))            # utils/ fica na raiz do projeto
 
-from utils import banco  # noqa: E402
+from utils import banco, originario_provavel  # noqa: E402
 from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, como_dicts, partes_do_banco  # noqa: E402
 from utils.legado import (limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
                           reservar_filas_mensais, soltar_filas_mensais)
+from utils.cobertura import logar_cobertura  # noqa: E402
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
@@ -98,6 +115,14 @@ WORKERS = 4                            # workers (threads deste processo) raspan
 TETO_CREDITO = 10 * 60                 # s por crédito; passou disso, volta para a fila (1ª lista de um advogado grande)
 ADIAMENTO = "30 minutes"               # erro passageiro
 ADIAMENTO_SEM_PUBLICACAO = "15 days"   # precatório ainda sem publicação no DJEN
+# PROCESSO_NAO_ENCONTRADO não é final de cara (a consulta/DJEN às vezes responde vazio): repete a busca uma vez na hora
+# (sem o cache das listas dos advogados e do DJEN dos candidatos) e, se continuar vazio, volta para a fila em
+# ADIAMENTO_NAO_ENCONTRADO; só na MAX_TENTATIVAS_NAO_ENCONTRADO-ésima vez grava FALHA. O contador vai no motivo da fila
+# ('[nao_encontrado=N]'), como no TJMA e no TJRJ. Não conta como falha técnica.
+ESPERA_REPETIR_BUSCA = 5
+ADIAMENTO_NAO_ENCONTRADO = "7 days"
+MAX_TENTATIVAS_NAO_ENCONTRADO = 3
+RE_CONTADOR_NAO_ENCONTRADO = re.compile(r"\[nao_encontrado=(\d+)\]")
 REORDENAR_A_CADA = 30 * 60             # s entre remontagens da ordem da fila (entram os adiados que venceram)
 MAX_FALHAS_SEGUIDAS = 8                # falhas técnicas seguidas que param a rodada
 MAX_REINICIOS = 30                     # rodadas que param (fonte fora, banco caiu) antes de desistir de vez
@@ -129,6 +154,7 @@ TAKE = 60                              # a API recusa Take acima de 60
 MAX_PAGINAS_ADVOGADO = 100             # 6.000 processos por advogado (+ ente) no máximo
 MAX_PAGINAS_NOME = 5                   # pesquisa pelo nome inteiro do credor (precatório antigo)
 MAX_ADVOGADOS = 6                      # advogados do precatório pesquisados (o DJEN os lista em ordem qualquer)
+MIN_INICIAIS_HONORARIOS = 3            # iniciais com menos letras não bastam para dizer que o credor é o advogado
 MAX_CACHE_ADVOGADOS = 300              # listas de processos (enxutas) guardadas entre créditos
 TIMEOUT_HTTP = 90
 RITMO_CONSULTA = 4.0                   # req/s para a consulta do TJMT (--ritmo)
@@ -159,6 +185,7 @@ RE_PASSIVO_PUBLICO = re.compile(r"MUNICIPIO|ESTADO D|INSTITUTO|FUNDACAO|AUTARQUI
 RE_SOCIEDADE_ADV = re.compile(r"\bADVOGADOS\b|\bADVOCACIA\b|SOCIEDADE INDIVIDUAL DE ADVOCACIA|ESCRITORIO DE ADVOCACIA")
 RE_JUIZO = re.compile(r"\bVARA\b|\bJUIZO\b|\bJUIZADO\b|\bCOMARCA\b|\bSDCR\b|TRIBUNAL")
 RE_EXECUCAO = re.compile(r"CUMPRIMENTO|EXECU")
+RE_VARA_FAZENDA = re.compile(r"FAZENDA PUBLICA")
 # certidão do espelho do precatório (Ofício Circular 24/2024-PRES): sai quando ESTE precatório é formado
 RE_ESPELHO = re.compile(r"espelho\)?\s+do\s+precat|formul[aá]rio\s*\(espelho\)", re.I)
 # ordem de expedição: mais fraca (às vezes é texto padrão: 'se ultrapassado o teto da RPV, expeça-se precatório')
@@ -379,7 +406,7 @@ class Djen:
         """Publicações da consulta (enxutas). ErroTecnico se não responder. O DJEN às vezes devolve 500 'muito
         ocupado': conta como resposta ruim e tenta de novo."""
         chave = json.dumps(params, sort_keys=True, ensure_ascii=False)
-        if usar_cache and chave in self.cache:
+        if usar_cache and chave in self.cache and not getattr(self.local, "sem_cache", False):
             return self.cache[chave]
         for _ in range(8):
             s = self._reservar()
@@ -630,6 +657,15 @@ class Consulta:
         """Processos do advogado (pelo nome) com o ente numa das partes (termo_ente=None: todos). Em cache; duas
         threads pedindo o mesmo advogado esperam uma só busca."""
         chave = (chave_nome(advogado), termo_ente)
+        if getattr(self.local, "sem_cache", False):     # 2ª busca de um não encontrado: lista nova, renova o cache
+            params = {"NomeOab": chave[0], **({"parteNome": termo_ente} if termo_ente else {})}
+            resultado = self.todos(prazo, **params)
+            with self.trava:
+                self.cache[chave] = resultado
+                self.cache.move_to_end(chave)
+                while len(self.cache) > MAX_CACHE_ADVOGADOS:
+                    self.cache.popitem(last=False)
+            return resultado
         with self.trava:
             if chave in self.cache:
                 self.cache.move_to_end(chave)
@@ -715,13 +751,18 @@ SELECT c.id AS credito_id, c.numero_exibicao AS precatorio, c.numero_norm, left(
        ARRAY(SELECT x.valor_lista FROM creditos.lista_item x
               WHERE x.credito_id = c.id AND x.removido_em IS NULL AND x.valor_lista > 0) AS valores,
        (SELECT st.codigo FROM creditos.coleta_credor_tentativa t JOIN creditos.status_coleta st ON st.id = t.status_id
-         WHERE t.credito_id = c.id ORDER BY t.id DESC LIMIT 1) AS ultimo_status
+         WHERE t.credito_id = c.id ORDER BY t.id DESC LIMIT 1) AS ultimo_status,
+       ARRAY(SELECT DISTINCT p.documento::text FROM creditos.credito_credor k JOIN creditos.pessoa p ON p.id = k.pessoa_id
+              WHERE k.credito_id = c.id AND k.papel_id = 1 AND p.documento IS NOT NULL
+                AND k.origem <> 'FONTE') AS docs_banco
   FROM creditos.credito c
   JOIN creditos.tipo_credito tc ON tc.id = c.tipo_credito_id
   LEFT JOIN LATERAL (SELECT x.valor_lista, x.metadata FROM creditos.lista_item x
                       WHERE x.credito_id = c.id ORDER BY x.removido_em NULLS FIRST, x.updated_at DESC LIMIT 1) li ON true
  WHERE c.id = %s
 """
+# docs_banco: CPF/CNPJ de credor que o banco já tinha de outra origem (CONTATOS, LEGADO...; FONTE é de robô): conta
+# como CPF_CREDOR no originário provável quando o candidato tem o mesmo documento
 
 
 def ler_credito(cur, credito_id):
@@ -738,6 +779,7 @@ def ler_credito(cur, credito_id):
     lead["situacao"] = lista.get("Situação") or ""
     lead["preferencia"] = normal(lista.get("Preferência"))      # IDADE: credor tinha 60+ anos no envio
     lead["faixa"] = FAIXAS[faixa_da_situacao(lead["situacao"])]
+    lead["docs_banco"] = list(lead["docs_banco"] or [])
     lead["valores"] = sorted({float(v) for v in (lead["valores"] or [])} |
                              ({valor_numerico(lead["valor_lista"])} if valor_numerico(lead["valor_lista"]) else set()))
     return lead
@@ -862,6 +904,69 @@ def advogados_do_precatorio(advogados, cpfs):
     return list(saida.values())
 
 
+def advogado_credor(itens, alvos, advogados):
+    """O advogado do precatório que é o próprio credor (honorários de advogado pessoa física), ou None. Regra do TJMA
+    (07/10/2026) e do TJDFT (08/10/2026):
+    - o polo A do DJEN tem uma pessoa só, em iniciais (MIN_INICIAIS_HONORARIOS letras ou mais), e as iniciais (com as
+      partículas, como o DJEN faz) batem com exatamente um advogado do precatório; ou
+    - o polo A só tem um advogado do precatório com o nome inteiro (do_djen o tira dos alvos, por isso 'polo ativo
+      vazio').
+    Sociedade de advogados não entra (vem com o nome inteiro e segue o caminho de sempre)."""
+    por_nome = {chave_nome(a["nome"]): a for a in advogados if a.get("oab")}
+    if len(alvos) == 1:
+        alvo = next(iter(alvos))
+        pub = iniciais_publicadas(alvo)
+        if not eh_iniciais(alvo) or len(pub) < MIN_INICIAIS_HONORARIOS:
+            return None
+        batem = [a for k, a in por_nome.items() if iniciais(k) == pub]
+        return batem[0] if len(batem) == 1 else None
+    if not alvos:
+        no_polo = {chave_nome(n) for it in itens for polo, n in it["partes"] if polo == "A" and n.strip()}
+        if len(no_polo) == 1 and no_polo <= set(por_nome):
+            return por_nome[next(iter(no_polo))]
+    return None
+
+
+def eh_o_advogado(parte, adv):
+    """A parte (credor de um candidato) é o advogado credor: mesmo nome (com a folga de mesmo_advogado) e, quando os
+    dois têm CPF, o mesmo CPF."""
+    doc, cpf = parte.get("documento") or "", adv.get("cpf") or ""
+    return mesmo_advogado(parte["nome"], adv["nome"]) and not (doc and cpf and doc != cpf)
+
+
+def credor_honorarios(r, adv, parte=None, desc=""):
+    """Grava no resultado o advogado do precatório como credor (honorários): CPF do próprio processo dele (parte) ou o
+    da consulta ao lado da OAB (adv['cpf']). Com CPF: CREDOR (liga_credor) + ADVOGADO com a OAB (já vem nos
+    advogados do precatório), SUCESSO_PROCESSO_CREDITO 'CREDOR_ADVOGADO: ... regra=HONORARIOS_ADVOGADO'; o
+    originário, quando confirmado, quem chama já pôs (status SUCESSO_PROCESSO_ORIGINARIO). Sem CPF: só ADVOGADO,
+    SUCESSO_INCOMPLETO 'SUCESSO_SEM_CPF ... regra=HONORARIOS_ADVOGADO'."""
+    parte = parte or {}
+    doc_parte = parte.get("documento") or ""
+    if len(doc_parte) == 11 and documento_valido(doc_parte):
+        doc, origem = doc_parte, "CPF do processo do advogado na consulta do TJMT"
+    elif len(adv.get("cpf") or "") == 11 and documento_valido(adv["cpf"]):
+        doc, origem = adv["cpf"], "CPF do advogado (pela OAB) na consulta do TJMT"
+    else:
+        doc, origem = "", ""
+    base = f"regra=HONORARIOS_ADVOGADO beneficiario={adv['nome']} oab={adv['oab_uf']}{adv['oab_numero']}"
+    extra = f"; {desc}" if desc else ""
+    r.update(regra="HONORARIOS_ADVOGADO", candidato_analisar=None,
+             credor={"nome": adv["nome"], "documento": doc or None, "papel_bruto": "HONORARIOS",
+                     "nascimento": parte.get("nascimento") if doc and doc == doc_parte else None})
+    if not doc:
+        r.update(status="SUCESSO_INCOMPLETO", liga_credor=False,
+                 motivo=f"SUCESSO_SEM_CPF: {base}{extra}"[:2000])
+        if not r["originario"]:
+            r["credor"] = None                          # sem CPF e sem originário: fica só como ADVOGADO
+        return r
+    if r["originario"]:
+        r["status"] = "SUCESSO_PROCESSO_ORIGINARIO"
+    else:
+        r.update(status="SUCESSO_PROCESSO_CREDITO", via="PRECATORIO", liga_credor=True)
+    r["motivo"] = f"CREDOR_ADVOGADO: o credor do precatório é o próprio advogado, {origem}; {base}{extra}"[:2000]
+    return r
+
+
 def pessoas_dos_candidatos(cands):
     """{chave da pessoa: [candidatos]}: pelo CPF/CNPJ; sem documento, pelo nome (junta com a de mesmo nome que tem)."""
     pessoas = {}
@@ -934,7 +1039,23 @@ def processar(lead, djen, consulta, inicio):
              advogados_djen=[f"{a['nome']} ({a['oab']}{a['uf']})" for a in advogados],
              fonte_nome="LEGADO" if nomes_legado else "DJEN",
              advogados_precatorio=advogados_do_precatorio(advogados, cpfs_adv))
+    # honorários: o credor (iniciais, ou o nome inteiro tirado dos alvos) é um advogado do precatório
+    adv_cred = None if nomes_legado else advogado_credor(itens, alvos, advogados)
+
+    def advogado_do_resultado():
+        """O advogado credor como advogados_do_precatorio o deixa (OAB separada e o CPF da consulta)."""
+        return next((a for a in r["advogados_precatorio"] if chave_nome(a["nome"]) == chave_nome(adv_cred["nome"])),
+                    None)
+
     if not alvos_ini and not alvos_nome:
+        if itens and adv_cred:
+            # o polo A só traz o advogado: os processos dele dão o CPF ao lado da OAB
+            tempo()
+            processos, _, _ = consulta.do_advogado(adv_cred["nome"], lead["termo_ente"] or None, prazo)
+            anotar_cpfs_advogados(processos, cpfs_adv)
+            r["advogados_precatorio"] = advogados_do_precatorio(advogados, cpfs_adv)
+            if (adv := advogado_do_resultado()):
+                return credor_honorarios(r, adv, desc="polo ativo do DJEN só com o advogado")
         if not itens:
             r.update(status="ADIAR", motivo="AINDA_SEM_PUBLICACAO: precatório sem publicação no DJEN")
         else:
@@ -977,7 +1098,15 @@ def processar(lead, djen, consulta, inicio):
         melhor_q = max(c["q"] for c in cands.values())
         cands = {n: c for n, c in cands.items() if c["q"] == melhor_q}
     pessoas = pessoas_dos_candidatos(cands)
+    adv = advogado_do_resultado() if adv_cred else None
+    if adv and len(pessoas) > 1 and all(eh_o_advogado(cs[0]["credor"], adv) for cs in pessoas.values()):
+        # o advogado com grafias/documento diferentes nos processos dele: é uma pessoa só
+        chave = next((k for k in pessoas if k.isdigit()), next(iter(pessoas)))
+        pessoas = {chave: [c for cs in pessoas.values() for c in cs]}
     r["n_pessoas"] = len(pessoas)
+    if not pessoas and adv:
+        # nenhum processo do advogado como autor: o crédito é dele (honorários), sem originário
+        return credor_honorarios(r, adv, desc="nenhum processo dos advogados com o credor como autor")
     if not pessoas:
         r["motivo"] = (f"PROCESSO_NAO_ENCONTRADO: nenhum processo dos advogados ({', '.join(a['nome'] for a in advogados[:MAX_ADVOGADOS])}) "
                        f"contra {lead['ente'] or 'o ente'} com autor {', '.join(sorted(alvos_ini | alvos_nome))[:120]}")
@@ -1002,7 +1131,8 @@ def processar(lead, djen, consulta, inicio):
     melhor = {k: max(forca(c) for c in cs) for k, cs in pessoas.items()}
     r["candidatos"] = [{"cnj": formatar_cnj(c["numero"]), "credor": c["credor"]["nome"],
                         "documento": c["credor"]["documento"], "classe": c["proc"]["classe"],
-                        "sistema": c["proc"]["sistema"], "casamento": c["q"], "fonte": c["fonte"],
+                        "orgao": c["proc"]["orgao"][:80], "sistema": c["proc"]["sistema"], "casamento": c["q"],
+                        "fonte": c["fonte"],
                         "evidencia": sorted(c["ev"]), "consultado_djen": c["consultado"]}
                        for k in sorted(pessoas, key=lambda k: -melhor[k]) for c in ordem_dos_candidatos(pessoas[k])][:20]
     topo = max(melhor.values())
@@ -1036,6 +1166,15 @@ def processar(lead, djen, consulta, inicio):
         return r
     honorarios = " (honorários: sociedade de advogados)" if RE_SOCIEDADE_ADV.search(chave_nome(credor["nome"])) else ""
     credor_certo = forca_topo >= FORCA_MINIMA or c["q"] == 3      # evidência no originário, ou o nome inteiro
+    if adv and eh_o_advogado(credor, adv):
+        # o credor escolhido é o próprio advogado do precatório (honorários): com evidência num processo dele, liga o
+        # originário; sem evidência (ou com dois processos igualmente prováveis), só o credor
+        if forca_topo >= FORCA_MINIMA and len(originarios_topo) == 1:
+            tempo()
+            datas = sorted(p["data"] for p in consulta.por_numero(c["numero"]) if p["data"])
+            proc = dict(c["proc"], data=datas[0]) if datas else c["proc"]
+            r.update(originario=c["numero"], via="ORIGINARIO", capa={"proc": proc, "credor": credor})
+        return credor_honorarios(r, adv, credor, desc.replace(f"regra={regra}", f"decisao={regra}"))
     if credor_certo and len(originarios_topo) == 1:
         # data de ajuizamento: a mais antiga do número (processo migrado para o PJe traz a data da migração)
         tempo()
@@ -1060,6 +1199,72 @@ def processar(lead, djen, consulta, inicio):
         r["candidato_analisar"] = {**r["credor"], "originario": formatar_cnj(c["numero"])}
         r["credor"] = None
     return r
+
+# =============================================================================== originário provável (não confirmado)
+
+
+def ano_cnj(numero):
+    """Ano do número CNJ ('1044704-14.2019.8.11.0041' ou os 20 dígitos) -> 2019; None se não for CNJ."""
+    d = so_digitos(numero)
+    return int(d[9:13]) if len(d) == 20 else None
+
+
+def sinais_do_candidato(c, docs, ano_precatorio, tem_ente):
+    """Candidato do robô (como fica em metadata.motor.candidatos) -> sinais da escala comum
+    (utils/originario_provavel.py), só com o que o robô já viu:
+    - CPF_CREDOR: documento da parte = o do credor confirmado pelo robô ou o de um credor que o banco já tinha de outra
+      origem (docs); NOME_CREDOR: nome inteiro igual (casamento 3); INICIAIS_CREDOR: só as iniciais (casamento 1-2);
+    - CITA_PRECATORIO (NUM_PRECATORIO), VALOR, EXPEDICAO_PERTO (certidão do espelho ou 'expeça-se' perto do envio; as
+      de longe não contam), do DJEN do candidato;
+    - ENTE_PASSIVO: achado na pesquisa com o ente (fonte ADVOGADO, ou NOME com o ente); ADVOGADO_EM_COMUM: achado nos
+      processos de um advogado do precatório (fonte ADVOGADO/ADVOGADO_SEM_ENTE);
+    - CLASSE_CUMPRIMENTO (cumprimento/execução), VARA_FAZENDA (órgão da Fazenda Pública, guardado desde 08/10/2026);
+    - ANO_ANTERIOR / ANO_POSTERIOR: ano do CNJ do candidato antes / depois do ano do precatório (o posterior sai)."""
+    sinais = {"NOME_CREDOR" if c.get("casamento") == 3 else "INICIAIS_CREDOR"}
+    if c.get("documento") and c["documento"] in docs:
+        sinais.add("CPF_CREDOR")
+    ev = set(c.get("evidencia") or [])
+    if "NUM_PRECATORIO" in ev:
+        sinais.add("CITA_PRECATORIO")
+    if "VALOR" in ev:
+        sinais.add("VALOR")
+    if ev & {"ESPELHO_PERTO", "EXPEDICAO_PERTO"}:
+        sinais.add("EXPEDICAO_PERTO")
+    fonte = c.get("fonte") or ""
+    if fonte == "ADVOGADO" or (fonte == "NOME" and tem_ente):
+        sinais.add("ENTE_PASSIVO")
+    if fonte in ("ADVOGADO", "ADVOGADO_SEM_ENTE"):
+        sinais.add("ADVOGADO_EM_COMUM")
+    if RE_EXECUCAO.search(normal(c.get("classe"))):
+        sinais.add("CLASSE_CUMPRIMENTO")
+    if RE_VARA_FAZENDA.search(normal(c.get("orgao"))):
+        sinais.add("VARA_FAZENDA")
+    ano = ano_cnj(c.get("cnj"))
+    if ano and ano_precatorio and ano != ano_precatorio:
+        sinais.add("ANO_ANTERIOR" if ano < ano_precatorio else "ANO_POSTERIOR")
+    return sinais
+
+
+def calcular_provavel(candidatos, docs, prec20, tem_ente, fonte="robo"):
+    """metadata.originario_provavel a partir dos candidatos guardados (None se nenhum passa no mínimo da escala)."""
+    ano = ano_cnj(prec20)
+    return originario_provavel.avaliar(
+        [{"numero_cnj": c["cnj"], "sinais": sorted(sinais_do_candidato(c, docs, ano, tem_ente)),
+          "credor": c.get("credor"), "documento": c.get("documento") or None, "classe": c.get("classe"),
+          "fonte_robo": c.get("fonte"), "evidencia_robo": c.get("evidencia") or []}
+         for c in candidatos or [] if c.get("cnj")], fonte)
+
+
+def provavel_do_resultado(lead, r, fonte="robo"):
+    """Originário provável do crédito processado, só quando o originário NÃO foi confirmado (r['originario'] vazio) e
+    o crédito não é FALHA nem volta para a fila. CPF do credor: o que o robô confirmou (credor certo com originário
+    ambíguo) e os que o banco já tinha de outra origem."""
+    if r["originario"] or r["status"] in ("FALHA", "ADIAR"):
+        return None
+    docs = set(lead.get("docs_banco") or [])
+    if r["credor"] and r["credor"].get("documento"):
+        docs.add(r["credor"]["documento"])
+    return calcular_provavel(r["candidatos"], docs, lead["precatorio20"], bool(lead.get("termo_ente")), fonte)
 
 # =============================================================================== banco: gravação de um crédito
 
@@ -1392,7 +1597,8 @@ def atualizar_filas_mensais(cur, filas, lead, r, status_legado, bk):
 def registrar_metadata(cur, lead, r):
     """Resumo da decisão em credito_fonte.metadata do software (a função troca o JSON inteiro: mescla aqui).
     Do DJEN só entram as iniciais/nome do credor, a contagem de publicações e os advogados (o texto não é guardado).
-    No SUCESSO_ANALISAR o candidato (nome, documento, originário) fica só aqui, para a revisão."""
+    No SUCESSO_ANALISAR o candidato (nome, documento, originário) fica só aqui, para a revisão. Originário não
+    confirmado: originario_provavel (com o originário confirmado, a chave sai)."""
     cur.execute("""SELECT f.metadata FROM creditos.credito_fonte f JOIN creditos.software s ON s.id = f.software_id
                     WHERE f.credito_id = %s AND s.codigo = %s""", (lead["credito_id"], SOFTWARE))
     linha = cur.fetchone()
@@ -1407,6 +1613,10 @@ def registrar_metadata(cur, lead, r):
                        "data_nascimento": r["credor"]["nascimento"], "cpf_encontrado": bool(r["credor"]["documento"])}
                       if r["credor"] else None)
     meta["candidato_analisar"] = r.get("candidato_analisar")
+    if r.get("originario_provavel"):
+        meta["originario_provavel"] = r["originario_provavel"]
+    else:
+        meta.pop("originario_provavel", None)            # confirmado (ou nenhum candidato): sem provável
     if r["capa"]:
         proc = r["capa"]["proc"]
         meta["capa_originario"] = {"classe": proc["classe"], "orgao": proc["orgao"], "jurisdicao": proc["jurisdicao"],
@@ -1903,6 +2113,10 @@ def esperar_adiados(rod):
     return True
 
 
+def nao_encontrado(r):
+    return r["status"] == "FALHA" and (r.get("motivo") or "").startswith("PROCESSO_NAO_ENCONTRADO")
+
+
 def processar_credito(rod, credito_id, n):
     """(Numa thread) Lê o crédito e decide credor e originário (DJEN + consulta), sem gravar nada.
     Devolve {tipo: LOTE, linha, lead, r} ou {tipo: ADIAR, credito_id, motivo, intervalo, linha, tecnico}."""
@@ -1919,7 +2133,30 @@ def processar_credito(rod, credito_id, n):
         linha.update(precatorio=lead["precatorio"], faixa=lead["faixa"], ente=lead["ente"],
                      ultimo_status=lead["ultimo_status"])
         r = processar(lead, rod.djen, rod.consulta, inicio)
-    except Exception as e:                              # erro passageiro (ou inesperado): volta para a fila
+        if nao_encontrado(r):
+            # repete uma vez antes de aceitar o vazio (a consulta/DJEN às vezes responde sem nada), sem cache
+            if rod.parar.wait(ESPERA_REPETIR_BUSCA):
+                raise ErroTecnico("INTERROMPIDO")
+            rod.djen.local.sem_cache = rod.consulta.local.sem_cache = True
+            try:
+                r = processar(lead, rod.djen, rod.consulta, time.time())
+            finally:
+                rod.djen.local.sem_cache = rod.consulta.local.sem_cache = False
+        r["originario_provavel"] = provavel_do_resultado(lead, r)
+        if nao_encontrado(r):
+            with rod.conexao_da_thread().cursor() as cur:
+                cur.execute("SELECT motivo_detalhe FROM creditos.coleta_credor WHERE credito_id = %s", (credito_id,))
+                m = RE_CONTADOR_NAO_ENCONTRADO.search((cur.fetchone() or [""])[0] or "")
+            vez = (int(m.group(1)) if m else 0) + 1
+            r["motivo"] = f"{r['motivo']}"[:1900] + f" [nao_encontrado={vez}]"
+            if vez < MAX_TENTATIVAS_NAO_ENCONTRADO:
+                linha.update(resultado="ADIADO_NAO_ENCONTRADO", motivo=r["motivo"],
+                             segundos=round(time.time() - inicio))
+                log.info(f"[{n}] {credito_id} {lead['precatorio']} -> processo não encontrado ({vez}ª vez): volta "
+                         f"em {ADIAMENTO_NAO_ENCONTRADO}")
+                return {"tipo": "ADIAR", "credito_id": credito_id, "motivo": r["motivo"],
+                        "intervalo": ADIAMENTO_NAO_ENCONTRADO, "linha": linha, "tecnico": False}
+    except Exception as e:                             # erro passageiro (ou inesperado): volta para a fila
         if isinstance(e, psycopg2.Error):
             rod.local.con = None                        # a próxima leitura desta thread abre conexão nova
         tecnico = isinstance(e, ErroTecnico)
@@ -1933,8 +2170,10 @@ def processar_credito(rod, credito_id, n):
     linha.update(segundos=round(time.time() - inicio), credor_djen=r["credor_djen"], publicacoes_djen=r["publicacoes"],
                  advogados_djen=" | ".join(r["advogados_djen"]))
     cand = r.get("candidato_analisar") or r["credor"] or {}
+    prov = r.get("originario_provavel")
     log.info(f"[{n}] {credito_id} {lead['precatorio']} -> {r['status']} "
              f"{formatar_cnj(r['originario']) if r['originario'] else ''} "
+             f"{('provável ' + prov['numero_cnj'] + ' (' + prov['confianca'] + ') ') if prov else ''}"
              f"{('doc ' + cand['documento']) if cand.get('documento') else ''} "
              f"| {r['credor_djen'][:40]} | {r['regra'] or r['motivo'].split(':')[0]} | {linha['segundos']} s")
     if r["status"] == "ADIAR":
@@ -1987,6 +2226,7 @@ def encerrar(rod, pendentes, inicio):
     log.info(f"{rod.modo}: {rod.n} crédito(s) em {rod.n_lote} lote(s), {minutos:.1f} min "
              f"({rod.n / minutos:.1f}/min) | " + ", ".join(f"{k}: {v}" for k, v in rod.resultados.most_common()))
     log.info(f"CSV: {rod.arq_credito}")
+    logar_cobertura(log, "TJMT", TRIBUNAL_TJMT)
 
 
 def ler_argumentos():

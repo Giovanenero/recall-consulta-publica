@@ -15,7 +15,7 @@ não traz nome, CPF nem originário, e a consulta pública do PJe (1º e 2º gra
    intimam fundos, escritórios e pessoas de outros precatórios (ADAUTO FORTES, DOMUS OCTANTE, FLAVIA CEOLIN...).
    Sem cabeçalho, vale o polo A só se tiver uma única pessoa física. Sem nenhuma publicação ainda: volta para a fila
    em ADIAMENTO_SEM_PUBLICACAO.
-3. Cada requerente do cabeçalho é classificado (mesmos critérios do corrigir_legado_TJPI.py): pessoa física, fundo
+3. Cada requerente do cabeçalho é classificado (mesmos critérios da correção do legado de 05/10): pessoa física, fundo
    (FIDC: cessionário), sociedade de advogados (honorários), ente público ou outra empresa. CPF/CNPJ só entra quando o
    texto o escreve logo depois do nome do próprio credor (decisão de pagamento: 'Beneficiário(a) … CPF …'); nome dentro
    de um nome maior ('… JUNIOR') não conta.
@@ -30,6 +30,11 @@ não traz nome, CPF nem originário, e a consulta pública do PJe (1º e 2º gra
    em comum só reforça: sozinha ela não distingue o conhecimento do cumprimento da mesma pessoa contra o mesmo ente.
    1 confirmado -> liga (fila_credor_registrar_originario, sem capa: não há capa pública); ação coletiva que já tem
    outros credores no banco -> não liga; empate ou nenhum -> candidatos só no metadata.
+   Sem confirmado: metadata.originario_provavel (escala comum do utils/originario_provavel.py: o mais provável,
+   confiança alta/media/baixa e os candidatos com os sinais), decisão do usuário de 08/10/2026: fica só no metadata,
+   não entra em credito_originario e não muda o status. Sinais: NOME_CREDOR, ENTE_PASSIVO, CITA_PRECATORIO (o
+   candidato cita o precatório ou é citado por ele), VALOR, ADVOGADO_EM_COMUM (a OAB em comum), CLASSE_CUMPRIMENTO e
+   ANO_ANTERIOR. Os já processados foram acertados em 08/10/2026.
 6. Status: CPF do credor no texto -> SUCESSO_PROCESSO_ORIGINARIO (com originário) ou SUCESSO_PROCESSO_CREDITO, com o
    credor ligado (registrar_credor, corrigindo o CPF divergente do banco). Sem CPF no texto, o próprio robô consulta
    a API de CPF pelo nome (utils/cpf_robo.py, decisão do usuário de 07/10/2026; regra, gate e cache do
@@ -86,11 +91,12 @@ AQUI = Path(__file__).resolve().parent
 if str(AQUI.parent) not in sys.path:
     sys.path.insert(0, str(AQUI.parent))            # utils/ fica na raiz do projeto
 
-from utils import banco, cpf_robo  # noqa: E402
+from utils import banco, cpf_robo, originario_provavel  # noqa: E402
 from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import como_dicts  # noqa: E402
 from utils.legado import (Backup, limpar_reservas_orfas, numero_do_credito, reserva_de_robo,  # noqa: E402
                           reservar_filas_mensais, soltar_filas_mensais)
+from utils.cobertura import logar_cobertura  # noqa: E402
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
@@ -158,6 +164,10 @@ RE_EMPRESA = re.compile(r"\b(?:LTDA|EIRELI|EPP|S A|S/A|CIA|COMPANHIA|ASSOCIACAO|
 RE_CLASSE_FORA = re.compile(r"PENAL|CRIMIN|CARTA PRECATORIA|CARTA DE ORDEM|INQUERITO|INVENTARIO|ARROLAMENTO|DIVORCIO|"
                             r"ALIMENTOS|EXECUCAO FISCAL|PRECATORIO|PEQUENO VALOR|REQUISICAO")
 RE_EXECUCAO = re.compile(r"CUMPRIMENTO|EXECU")
+# evidência do robô -> sinal da escala comum do originário provável (utils/originario_provavel.py). O CNJ citado no
+# DJEN do precatório (o precatório cita o candidato) vale como a citação ao contrário (o candidato cita o precatório)
+SINAL_DA_EVIDENCIA = {"CITA_PRECATORIO": "CITA_PRECATORIO", "CITADO_NO_PRECATORIO": "CITA_PRECATORIO",
+                      "VALOR": "VALOR", "OAB_EM_COMUM": "ADVOGADO_EM_COMUM"}
 # palavras do nome do ente que não ajudam a reconhecê-lo no polo passivo
 PALAVRAS_ENTE = {"MUNICIPIO", "ESTADO", "PREFEITURA", "MUNICIPAL", "DE", "DO", "DA", "DOS", "DAS", "E"}
 
@@ -166,8 +176,8 @@ STATUS_COM_VINCULO = ("SUCESSO_PROCESSO_ORIGINARIO", "SUCESSO_INCOMPLETO")
 
 COLUNAS = ["processado_em", "modo", "credito_id", "precatorio", "ente", "ultimo_status", "resultado", "motivo",
            "originario", "regra", "evidencia", "credor", "credor_documento", "requerentes_djen", "fonte_nome",
-           "publicacoes_djen", "advogados_djen", "candidatos", "credor_corrigido", "legado", "credores_antes",
-           "credores_depois", "cpf_api", "lote", "segundos"]
+           "publicacoes_djen", "advogados_djen", "candidatos", "originario_provavel", "credor_corrigido", "legado",
+           "credores_antes", "credores_depois", "cpf_api", "lote", "segundos"]
 COLUNAS_TROCAS = ["processado_em", "modo", "credito_id", "precatorio", "credores_antes", "credores_depois",
                   "saiu", "entrou"]
 SEM_GRAVACAO = {"legado": "", "antes": set(), "depois": set(), "corrigidos": []}
@@ -581,7 +591,7 @@ def resultado_vazio():
     """Resultado a gravar, antes de decidir."""
     return {"status": "FALHA", "motivo": "", "via": "PROCESSO_CREDITO", "originario": None, "regra": "",
             "evidencia": "", "credor": None, "candidato_analisar": None, "candidatos": [], "requerentes": [],
-            "fonte_nome": "", "requerido": "", "publicacoes": 0, "advogados": []}
+            "fonte_nome": "", "requerido": "", "publicacoes": 0, "advogados": [], "originario_provavel": None}
 
 
 def candidatos_originario(djen, lead, credor, pub):
@@ -645,6 +655,45 @@ def confirmar_originario(djen, lead, credor, pub, cands):
     return None, vistos, (f"ORIGINARIO_EMPATADO:{len(confirmados)}" if confirmados else "")
 
 
+def sinais_do_candidato(c, ano_precatorio, ente_conferido):
+    """Candidato como fica em metadata.motor.candidatos -> sinais da escala comum (utils/originario_provavel.py):
+    NOME_CREDOR (credor no polo ativo do DJEN do candidato, ou achado pelo nome no polo ativo), ENTE_PASSIVO (só se o
+    ente da lista foi conferido), CITA_PRECATORIO (o candidato cita o precatório ou o precatório cita o candidato),
+    VALOR, ADVOGADO_EM_COMUM (OAB do precatório no candidato), CLASSE_CUMPRIMENTO e ANO_ANTERIOR/ANO_POSTERIOR.
+    Sem CPF (o DJEN do candidato não traz) e sem vara nem expedição."""
+    sinais = {SINAL_DA_EVIDENCIA[e] for e in c.get("evidencia") or [] if e in SINAL_DA_EVIDENCIA}
+    if c.get("credor_no_ativo") or "NOME_NO_DJEN" in (c.get("fontes") or []):
+        sinais.add("NOME_CREDOR")
+    if ente_conferido and c.get("ente_no_passivo") and c.get("publicacoes"):
+        sinais.add("ENTE_PASSIVO")
+    if RE_EXECUCAO.search(normal(c.get("classe"))):
+        sinais.add("CLASSE_CUMPRIMENTO")
+    ano = so_digitos(c.get("cnj"))[9:13]
+    if len(ano) == 4 and len(ano_precatorio) == 4:
+        if ano < ano_precatorio:
+            sinais.add("ANO_ANTERIOR")
+        elif ano > ano_precatorio:
+            sinais.add("ANO_POSTERIOR")
+    return sorted(sinais)
+
+
+def provavel_do_credito(candidatos, precatorio20, ente_conferido, fonte="robo"):
+    """metadata.originario_provavel quando o originário não foi confirmado (decisão do usuário de 08/10/2026: fica só
+    no metadata; não entra em creditos.credito_originario nem muda o status; a OAB em comum continua sem ligar).
+    None sem candidato que passe no mínimo."""
+    ano = so_digitos(precatorio20)[9:13]
+    return originario_provavel.avaliar(
+        [{"numero_cnj": c["cnj"], "sinais": sinais_do_candidato(c, ano, ente_conferido),
+          "classe": c.get("classe") or "", "evidencia_robo": c.get("evidencia") or [],
+          "publicacoes": c.get("publicacoes")}
+         for c in candidatos or [] if c.get("cnj")], fonte)
+
+
+def texto_provavel(p):
+    """Originário provável para o CSV: 'cnj (confiança, pontos, sinais)'."""
+    return f"{p['numero_cnj']} ({p['confianca']}, {p['pontos']} pts, {'+'.join(p['sinais'])})" if p else ""
+
+
 def processar(lead, djen, cpf_api=None):
     """Decide credor e originário de um crédito só lendo (DJEN) e, com o credor sem CPF, consulta a API de CPF pelo
     nome. Devolve o resultado a gravar (status ADIAR = volta para a fila)."""
@@ -693,6 +742,9 @@ def processar(lead, djen, cpf_api=None):
     cands = candidatos_originario(djen, lead, nome, pub)
     originario, vistos, regra_orig = confirmar_originario(djen, lead, nome, pub, cands) if cands else (None, [], "")
     r.update(credor=credor, candidatos=vistos, originario=originario, evidencia=regra_orig if originario else "")
+    if not originario:
+        # não confirmou: o mais provável, com a confiança, fica só no metadata (o status e o vínculo não mudam)
+        r["originario_provavel"] = provavel_do_credito(vistos, lead["precatorio20"], bool(lead["chaves"]))
     desc = f"credor {nome} no DJEN do precatório ({pub['fonte']})"
     sufixo = (f"; originário {formatar_cnj(originario)} ({regra_orig})" if originario
               else (f"; {regra_orig}" if regra_orig else ""))
@@ -794,6 +846,12 @@ def registrar_metadata(cur, lead, r):
     meta["candidato_analisar"] = r.get("candidato_analisar")
     if r.get("cpf_api"):
         meta["cpf_api"] = cpf_robo.metadata_cpf_api(r["cpf_api"])
+    # originário provável (escala comum, utils/originario_provavel.py): só quando o originário não foi confirmado; o
+    # de uma rodada anterior sai quando agora confirmou ou não há candidato
+    if r.get("originario_provavel") and not r["originario"]:
+        meta["originario_provavel"] = r["originario_provavel"]
+    else:
+        meta.pop("originario_provavel", None)
     cur.execute("""SELECT 1 FROM creditos.credito WHERE id = %s
                       AND numero_norm = COALESCE(creditos.cnj_normalizar(%s), creditos.so_digitos(%s))""",
                 (lead["credito_id"], lead["numero_norm"], lead["numero_norm"]))
@@ -1011,6 +1069,7 @@ def registrar_lote(rod, lote, gravados):
                      cpf_api=cpf_robo.texto_csv(r.get("cpf_api")),
                      candidatos=" | ".join(f"{c['cnj']}[{'+'.join(c['evidencia']) or '-'}"
                                            f"{' OK' if c['confirmado'] else ''}]" for c in r["candidatos"][:8]),
+                     originario_provavel=texto_provavel(r.get("originario_provavel")),
                      legado=g["legado"], credor_corrigido=" | ".join(g["corrigidos"]),
                      credores_antes=fmt_credores(g["antes"]), credores_depois=fmt_credores(g["depois"]),
                      lote=rod.n_lote)
@@ -1369,6 +1428,7 @@ def encerrar(rod, pendentes, inicio):
     log.info(f"{rod.modo}: {rod.n} crédito(s) em {rod.n_lote} lote(s), {minutos:.1f} min "
              f"({rod.n / minutos:.1f}/min) | " + ", ".join(f"{k}: {v}" for k, v in rod.resultados.most_common()))
     log.info(f"CSV: {rod.arq_credito}")
+    logar_cobertura(log, "TJPI", TRIBUNAL_TJPI)
 
 
 def ler_argumentos():

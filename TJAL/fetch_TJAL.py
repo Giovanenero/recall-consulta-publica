@@ -11,12 +11,12 @@ fetch_TJAL.py - enriquece os leads do TJAL pela consulta pública (substitui o m
    (fica só o desfazer_tabelas_antigas.sql da gravação).
 
 Uso:
-    python fetch_TJAL.py --simulacao                # todos os leads; desfaz no banco (ROLLBACK): só mostra o resumo
-    python fetch_TJAL.py                            # todos os leads; GRAVA no banco
-    python fetch_TJAL.py --fila --limite 500        # fila (modo 5 do RPA_SISTEMAS): grava até 500 leads da fila
-    python fetch_TJAL.py --fila --limite 20 --simulacao
+    python fetch_TJAL.py                            # a fila inteira (leads disponíveis); GRAVA no banco
+    python fetch_TJAL.py --simulacao                # a fila inteira; desfaz no banco (ROLLBACK): só mostra o resumo
+    python fetch_TJAL.py --limite 500               # no máximo 500 leads da fila (o modo 5 do RPA passa --fila --limite)
+    python fetch_TJAL.py --creditos lista.txt       # só os créditos da lista (reprocessar, mesmo já em SUCESSO)
 
---fila: só os leads em FALHA/PENDENTE (os únicos cujo status o robô melhora) que ele não raspou nos últimos DIAS_FILA
+Fila (o padrão; --fila continua aceito): só os leads em FALHA/PENDENTE (os únicos cujo status o robô melhora) que ele não raspou nos últimos DIAS_FILA
 dias, com número CNJ do TJAL que bate com o crédito, do mais prioritário e de maior valor para o menor. Gravando, cada
 lead é reservado antes da raspagem (coleta_credor em EM_ANDAMENTO com lease deste processo, sem trocar o software, e
 as linhas do precatório nas filas mensais em CREDOR_EM_ANDAMENTO com a marca do robô): o RPA com token A3 e outra
@@ -57,6 +57,7 @@ if str(AQUI.parent) not in sys.path:
 from utils.arquivos import gravar_csv  # noqa: E402
 from utils.banco import chave_texto_lote, conectar, filas_antigas, id_do_software, partes_do_banco  # noqa: E402
 from utils.legado import MARCA_RESERVA, reservar_filas_mensais, soltar_filas_mensais  # noqa: E402
+from utils.cobertura import logar_cobertura  # noqa: E402
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
 
@@ -97,6 +98,7 @@ ORGAO_PUBLICO_CONTEM = ("procuradoria", "defensoria publica", "ministerio public
                         "prefeitura", "camara municipal", "assembleia legislativa", "tribunal de justica",
                         "tribunal de contas")
 ORGAO_PUBLICO_PREFIXO = ("estado d", "municipio d", "uniao federal", "uniao (", "df -", "distrito federal")
+OAB_FICTICIA = "99999"                 # o e-SAJ põe a OAB 99999P no 'Procurador Geral do Município...'
 PAPEIS_DE_CREDOR = ("credor", "requerente", "reqte", "autor", "exequente", "exeqte", "favorecido", "impetrante")
 
 PAGAMENTO = re.compile(
@@ -179,6 +181,12 @@ def orgao_publico(nome):
     """Nome de órgão público (procuradoria, estado, município...): não é credor de precatório."""
     n = normal(nome)
     return bool(n) and (any(k in n for k in ORGAO_PUBLICO_CONTEM) or n.startswith(ORGAO_PUBLICO_PREFIXO))
+
+
+def procurador_do_ente(a):
+    """Representante que é o órgão ou o cargo ('Procuradoria Geral do Estado', 'Procurador Geral do Município de
+    Maceió'), ou com a OAB fictícia do e-SAJ: não é advogado de credor."""
+    return orgao_publico(a["nome"]) or normal(a["nome"]).startswith("procurador")         or a.get("oab_numero", "").startswith(OAB_FICTICIA)
 
 
 def sim_nao(v):
@@ -571,8 +579,29 @@ def polo_do_rotulo(rotulo, classes_tr=""):
     return "OUTRO"
 
 
+MARCA_ADVOGADOS = re.compile(r"Advogados?\s*\(s\)\s*:", re.I)
+OAB_NO_TEXTO = re.compile(r"\s*,?\s*([^,:()]+?)\s*\(OAB\s*(\d+[A-Z]?)\s*/?\s*([A-Z]{2})\s*/?\s*\)")
+
+
+def oabs_das_movimentacoes(movs):
+    """{nome normalizado: {(número, UF), ...}} a partir do texto das movimentações, só na lista depois de
+    "Advogados(s):" (ex.: "Advogados(s): Fábio Barbosa Maciel (OAB 7147/AL), Fulano (OAB 9693AL /)")."""
+    mapa = {}
+    for mov in movs:
+        for marca in MARCA_ADVOGADOS.finditer(mov):
+            pos = marca.end()
+            while m := OAB_NO_TEXTO.match(mov, pos):        # só a lista contínua logo após a marca
+                nome = " ".join(normal(m.group(1)).split())
+                if nome:
+                    mapa.setdefault(nome, set()).add((m.group(2).lstrip("0"), m.group(3)))
+                pos = m.end()
+    return mapa
+
+
 def partes_e_advogados(sp):
-    """Todas as partes e seus representantes. O 2º grau traz a OAB num <input hidden value="6717AL">."""
+    """Todas as partes e seus representantes. O 2º grau traz a OAB num <input hidden value="6717AL">; o 1º grau
+    só mostra o nome, e a OAB sai do texto das movimentações da mesma página ("Advogados(s): Nome (OAB 7147/AL)"),
+    usada só quando o nome tem uma única OAB ali."""
     tabela = sp.find(id="tableTodasPartes") or sp.find(id="tablePartesPrincipais")
     partes, advogados = [], []
     if not tabela:
@@ -583,7 +612,7 @@ def partes_e_advogados(sp):
             continue
         papel = texto(tr.find(class_="tipoDeParticipacao")).rstrip(":").strip()
         polo = polo_do_rotulo(papel, " ".join(tr.get("class", [])))
-        nome, atual = [], None
+        nome, atual, n_antes = [], None, len(advogados)
         for node in td.children:
             tag = getattr(node, "name", None)
             if tag == "span" and "mensagemExibindo" in node.get("class", []):
@@ -598,10 +627,22 @@ def partes_e_advogados(sp):
                 elif t:
                     atual["nome"] = f"{atual['nome']} {t}".strip()
         partes.append({"polo": polo, "papel": papel, "nome": re.sub(r"\s+", " ", " ".join(nome)).strip()})
+        if orgao_publico(partes[-1]["nome"]):
+            for a in advogados[n_antes:]:
+                a["do_orgao"] = True
     for a in advogados:
         a["nome"] = re.sub(r"\s+", " ", a["nome"]).strip()
         m = re.fullmatch(r"0*(\d+[A-Z]?)([A-Z]{2})", a.pop("oab"))
         a["oab_numero"], a["oab_uf"] = (m.group(1), m.group(2)) if m else ("", "")
+    # o procurador do ente (Município, Estado: 'Procurador Geral do Município de Maceió', OAB 99999P) não é advogado
+    # de credor, nem quando o ente está no polo ativo
+    advogados = [a for a in advogados if not (a.pop("do_orgao", False) or procurador_do_ente(a))]
+    if any(not a["oab_numero"] for a in advogados):
+        mapa = oabs_das_movimentacoes(movimentacoes(sp))
+        for a in advogados:
+            achadas = mapa.get(" ".join(normal(a["nome"]).split()), set())
+            if not a["oab_numero"] and len(achadas) == 1:
+                a["oab_numero"], a["oab_uf"] = next(iter(achadas))
     return partes, advogados
 
 
@@ -1292,8 +1333,7 @@ def atualizar_capa_antiga(cur, r):
         registrar("DELETE", "precatorios.partes_processuais", q["id"], q)
 
     # 2) OAB dos advogados (só onde está vazia, pelo nome)
-    oabs = {normal(a["nome"]): (a["oab_numero"], a["oab_uf"]) for a in r["advogados"]
-            if a.get("oab_numero") and a["grau"].startswith("2")}
+    oabs = {normal(a["nome"]): (a["oab_numero"], a["oab_uf"]) for a in r["advogados"] if a.get("oab_numero")}
     n_oab = 0
     if oabs:
         cur.execute("""SELECT id, nome, oab_numero, oab_uf FROM precatorios.advogados
@@ -1559,26 +1599,33 @@ def executar(leads, gravar, pasta):
 
 
 def ler_argumentos():
-    """--simulacao: faz tudo, mas desfaz a atualização do banco. --fila [--limite N]: só os leads da fila."""
-    ap = argparse.ArgumentParser(description="Enriquece os leads do TJAL pela consulta pública e atualiza o banco.")
+    """Sem argumento nenhum: a fila inteira (leads disponíveis: FALHA/PENDENTE não raspados há DIAS_FILA dias), com
+    reserva e gravação. As opções existem para o modo 5 do RPA_SISTEMAS e para testes; nenhuma é obrigatória."""
+    ap = argparse.ArgumentParser(description="Enriquece os leads disponíveis do TJAL pela consulta pública e atualiza "
+                                             "o banco (sem argumentos: a fila inteira).")
     ap.add_argument("--simulacao", action="store_true",
                     help="faz tudo, mas desfaz a atualização do banco (ROLLBACK): só mostra o resumo")
     ap.add_argument("--fila", action="store_true",
-                    help=f"só FALHA/PENDENTE não raspados há {DIAS_FILA} dias, reservados durante a rodada "
-                         "(modo 5 do RPA_SISTEMAS)")
+                    help="aceito só por compatibilidade (o modo 5 do RPA passa): a fila já é o padrão")
     ap.add_argument("--limite", type=int, default=None,
-                    help="com --fila: no máximo N leads nesta rodada (0 = a fila inteira)")
+                    help="no máximo N leads da fila nesta rodada (0 ou ausente = a fila inteira)")
     ap.add_argument("--com-desfazer", action="store_true",
                     help="escreve os arquivos de desfazer (desfazer_*.sql e backup .csv); o padrão é não escrever")
     ap.add_argument("--sem-desfazer", action="store_true",
                     help="não escreve os arquivos de desfazer (já é o padrão; os ciclos do modo 5 do RPA passam)")
+    ap.add_argument("--creditos", default=None,
+                    help="só estes créditos: ids separados por vírgula, ou um arquivo com um id por linha")
     args = ap.parse_args()
     global GERAR_DESFAZER
     GERAR_DESFAZER = args.com_desfazer and not args.sem_desfazer
-    if args.limite is not None and not args.fila:
-        ap.error("--limite só vale com --fila")
+    if args.creditos:
+        if args.fila or args.limite is not None:
+            ap.error("--creditos não vale com --fila nem com --limite")
+        fonte = Path(args.creditos).read_text(encoding="utf-8") if Path(args.creditos).is_file() else args.creditos
+        args.creditos = {int(x) for x in re.split(r"[\s,;]+", fonte) if x.strip()}
     if args.limite is not None and args.limite < 0:
         ap.error("--limite precisa ser 0 ou mais")
+    args.fila = not args.creditos          # a fila é o padrão; só --creditos roda uma lista fixa
     return args
 
 
@@ -1590,7 +1637,8 @@ def main():
     gravar = not args.simulacao
     if args.fila:
         WORKER = f"consulta_publica_tjal:{socket.gethostname()}:{os.getpid()}"   # dono do lease desta rodada
-    pasta = pasta_da_execucao(("fila-" if args.fila else "") + ("gravacao" if gravar else "simulacao"))
+    pasta = pasta_da_execucao(("fila-" if args.fila else "creditos-" if args.creditos else "")
+                              + ("gravacao" if gravar else "simulacao"))
 
     if gravar:
         log.warning("ATENÇÃO: esta execução vai GRAVAR no banco (schema creditos, filas do robô e capa antiga). "
@@ -1607,6 +1655,10 @@ def main():
         if not leads:
             log.info("Fila vazia: nada a fazer.")
             return
+    elif args.creditos:
+        leads = [l for l in leads if l["credito_id"] in args.creditos]
+        log.info(f"{len(leads)} leads do TJAL entre os {len(args.creditos)} créditos pedidos "
+                 f"(lidos em {time.time() - t0:.1f}s)")
     else:
         log.info(f"{len(leads)} leads do TJAL na lista (lidos em {time.time() - t0:.1f}s)")
     originais, filas = {}, []
@@ -1621,6 +1673,7 @@ def main():
                         "Rode o mesmo comando de novo para continuar de onde parou.")
     finally:
         soltar_leads(leads, originais, filas)
+    logar_cobertura(log, "TJAL", TRIBUNAL_TJAL)
 
 
 if __name__ == "__main__":

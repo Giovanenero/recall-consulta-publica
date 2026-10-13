@@ -19,6 +19,7 @@ python TJBA/fetch_TJBA.py --limite 30             # modo real, para depois de 30
 python TJBA/fetch_TJBA.py --workers 4             # 4 workers neste terminal (Ctrl+C para todos)
 python TJBA/fetch_TJBA.py --workers 4 --simulacao --limite 5   # teste: 4 workers, 5 créditos cada, tudo desfeito
 python TJBA/fetch_TJBA.py --worker 2              # só o 2º worker, em outro terminal
+python TJBA/fetch_TJBA.py --simulacao --creditos 912183,913387   # simulação só nesses créditos
 ```
 
 - `.env`: `PG_*`; `PROXY_01..05` só para os workers 2 em diante (ver abaixo).
@@ -163,6 +164,52 @@ Para quando o desempate prévio é confirmado. Passou de 15 min no crédito -> `
 | idem, e os processos achados pelo nome (beneficiário no ativo, ente no passivo) têm todos o mesmo CPF/CNPJ válido | `SUCESSO_ANALISAR` / `PROC_SEM_CAPA_CREDOR_OUTRO_PROCESSO`, regra `CREDOR_OUTRO_PROCESSO` | sim (sem capa), e **liga o credor** sem processo |
 | nenhum confirmado | `FALHA` / `PROCESSO_NAO_ENCONTRADO` | não |
 
+**Originário provável** (desde 08/10/2026, como o artifact "Ordem Cronológica dos TJs" pede). Quando o originário não
+é confirmado (`SUCESSO_ANALISAR`, `PROCESSO_NAO_ENCONTRADO` com candidatos) e o crédito não tem originário ligado, os
+candidatos viram `metadata.originario_provavel`: o melhor candidato, a confiança (`alta`, `media`, `baixa`), os
+pontos, a margem para o 2º e até 5 candidatos com os sinais. **Só no metadata** (decisão do usuário): não entra em
+`credito_originario` e não muda o status. Com originário confirmado a chave sai. A escala é a comum dos robôs
+(`utils/originario_provavel.py`); `sinais_do_candidato` traduz o que o robô sabe de cada candidato:
+
+| O robô sabe | Sinal |
+|---|---|
+| confirmado na capa (beneficiário no ativo, ente no passivo) | `NOME_CREDOR` + `ENTE_PASSIVO` |
+| idem, e o CPF/CNPJ dele é o que o banco já tinha para o credor por outra fonte (não `FONTE`) | + `CPF_CREDOR` |
+| linha sem detalhe público que mostra beneficiário X ente (`linha_confere`) | `NOME_CREDOR` + `ENTE_PASSIVO` |
+| capa não lida, achado pelo nome no DJEN/PJe | só `NOME_CREDOR` (o confirmado na capa fica à frente) |
+| capa lida e não confere | nenhum sinal do credor: sai da lista |
+| DJEN do candidato cita o valor/precatório, ou pista `RPA_OK` | `VALOR` |
+| OAB em comum (DJEN do candidato x DJEN do precatório, ou advogado do ativo da capa x advogado do credor no DJEN do precatório) | `ADVOGADO_EM_COMUM` |
+| classe cumprimento/execução de sentença | `CLASSE_CUMPRIMENTO` |
+| ano do CNJ anterior / posterior ao do precatório | `ANO_ANTERIOR` / `ANO_POSTERIOR` (exclui) |
+
+Os já processados ganharam o provável em 08/10/2026 pelo `recalcular_originario_provavel.py` (script de uma vez só, já rodado e removido do repositório). Validação de 08/10/2026 nos
+6.329 créditos com originário confirmado (escondendo qual foi o escolhido): `alta` acertou 99,9% (1.167); nos 1.066
+que tinham 2+ confirmados (o caso parecido com o `SUCESSO_ANALISAR`), `alta` 99,5%, `media` 74% e `baixa` 58%.
+
+**Honorários de advogado pessoa física** (`aplicar_honorarios`, regra do TJMA de 07/10/2026, do TJMT e do TJDFT de
+08/10). O beneficiário da lista é o próprio advogado do precatório: o robô procurava um originário em que ele fosse
+parte (e descartava as publicações em que ele é advogado), e o crédito ficava `FALHA PROCESSO_NAO_ENCONTRADO ...
+(honorários?)`. Agora, depois da busca do originário:
+
+- prova de que ele é advogado **deste** precatório (`advogado_credor`; homônimo com OAB no banco não basta): um
+  advogado do DJEN do precatório (do lado do credor, ou `SEM_LADO`) com OAB-BA e o mesmo nome do beneficiário, ou a OAB
+  que o banco tem para o nome do beneficiário entre as do precatório. Mesmo nome = as mesmas palavras com grafia
+  próxima (SOUSA x SOUZA, FARIA x FARIAS) e FILHO/JUNIOR/NETO iguais (`mesmo_nome_hon`). Uma OAB só; espólio,
+  sociedade de advogados e nome de uma palavra ficam como antes;
+- CPF (`cpf_do_advogado_credor`, dígito conferido; fontes diferentes com CPFs diferentes -> sem CPF): a linha do
+  advogado (mesma OAB) num detalhe do PJe aberto no crédito, a pessoa do banco dona da OAB (`pessoa_oab` -> `pessoa`,
+  um documento só) ou os processos confirmados em que ele é o autor;
+- com CPF: **CREDOR** (sem processo) + **ADVOGADO** com a OAB, `SUCESSO_PROCESSO_CREDITO` (`SUCESSO_PROCESSO_ORIGINARIO`
+  se o originário foi confirmado), motivo `CREDOR_ADVOGADO: ... regra=HONORARIOS_ADVOGADO beneficiario=... oab=BAnnn
+  prova=...; antes: <motivo de antes>`;
+- sem CPF: só **ADVOGADO**, `SUCESSO_INCOMPLETO 'SUCESSO_SEM_CPF: regra=HONORARIOS_ADVOGADO ...'`;
+- o credor já achado é o advogado (mesmo nome e CPF): só a marca no motivo (o status fica; `SUCESSO_ANALISAR` vira
+  `SUCESSO_PROCESSO_CREDITO`); credor achado de outra pessoa: não muda, só a nota no motivo.
+
+Os já processados foram acertados em 08/10/2026 pelo `religar_honorarios.py` (script de uma vez só, já rodado e removido do repositório); o desfazer ficou em
+`saida/desfazer_religar_honorarios_<rodada>.sql`.
+
 **Processo achado sem link para o detalhe** (visto em 05/10/2026, ex.: 8031939-09.2021.8.05.0001). A pesquisa traz a
 linha ("1 resultados encontrados", classe, número e "1ª parte do polo ativo X 1ª do passivo"), mas sem o "Ver
 detalhes" e sem a última movimentação: o detalhe não é público e não abre por outro caminho (o id interno da linha
@@ -205,6 +252,15 @@ Logo depois de processado, o crédito é gravado numa **transação só dele** (
    vai sem processo (`processo_id` nulo): o credor é certo, o originário não. Por isso não se liga originário nenhum
    — o recálculo do `registrar_capa` copiaria para o crédito também os advogados do processo, que podem ser de outra
    ação da mesma pessoa.
+   Em **todo lead** (com ou sem originário, desde 08/10/2026): os advogados do credor no DJEN do precatório
+   (`processar` consulta `numeroProcesso=<precatório>` no início; `utils/advogados_djen.py`) vão para o crédito com
+   `registrar_credor(ADVOGADO, nome, OAB)` — direto no crédito, sem processo e sem `registrar_capa` (não espalha para
+   outros créditos). Lado do credor = rótulo do texto ('Advogado do(a) REQUERENTE:'), ou o destinatário com as
+   iniciais dele no polo A (o DJEN do TJBA intima o advogado como destinatário: A = credor, T = terceiro), ou, na
+   publicação sigilosa sem rótulo, destinatários só credor + órgão público. Advogado do ente, de terceiro
+   (cessionário, fundo) ou sem lado fica fora; a pessoa é a que o banco já tem pela OAB (OAB de outro nome ou
+   advogado com o mesmo nome já no crédito: não liga). O `metadata.motor.djen` guarda `advogados` e `advogados_fora`.
+   Créditos processados antes disso: acertados pelo `utils/completar_advogados_djen.py` (script de uma vez só, já rodado e removido do repositório).
 3. Para cada capa (a escolhida e as outras confirmadas no PJe): `travar_processo` (o mesmo advisory lock do
    `registrar_capa`) e `registrar_capa`. `partes_para_banco`: capa do banco é reenviada como está; PJe completo vale
    por inteiro (CPF que faltar vem do banco pelo mesmo nome); PJe cortado só acrescenta. Só advogados do polo ativo.
@@ -212,7 +268,8 @@ Logo depois de processado, o crédito é gravado numa **transação só dele** (
    campo vazio; `precatorio_relacionado` quando é `SUCESSO_PROCESSO_ORIGINARIO` e o precatório ainda não está em
    outro originário), `originarios.partes_processuais` e `originarios.advogados` (trocados se o PJe veio completo).
 5. `registrar_metadata`: `credito_fonte.metadata` do software ganha `motor` (resultado, regra, fontes, candidatos) e
-   `capa_originario`, via `registrar_credito` (conferindo antes que o número bate com o crédito).
+   `capa_originario`, via `registrar_credito` (conferindo antes que o número bate com o crédito). Sem originário,
+   também `originario_provavel` (ver a decisão acima); com originário, essa chave sai.
 6. `atualizar_filas_mensais`: status legado, motivo e `numero_originario` nas linhas do precatório nas filas
    mensais (pula `CREDOR_EM_ANDAMENTO`).
 7. `fila_credor_finalizar` (status, motivo, via, sistema PJE, processo, `detalhe` JSON com as partes e os credores
@@ -258,8 +315,8 @@ passam, continua aceito.
 | DJEN | `proxies_do_env`, `saida_djen`, `Djen` (`buscar`, `por_nome`, `por_numero`), `candidatos_djen`, `oabs_do_precatorio` |
 | PJe | `localizar_chrome`, `porta_livre`, `esperar_cdp`, `partes_da_pagina`, `campos_da_capa`, `captcha_aberto`, `achar_buraco`, `arrastar_slider`, `Pje` (`abrir`, `fechar`, `reabrir`, `conferir_no_ar`, `esperar`, `consultar`, `pesquisar`, `ler_detalhe`) |
 | banco: leitura | `conectar`, `SQL_CREDITO`, `ler_credito`, `pistas_do_rpa`, `credores_do_credito`, `confirmar` |
-| decisão | `processar` |
-| gravação de um crédito | `Backup`, `id_do_software`, `filas_antigas`, `partes_para_banco`, `capa_para_banco`, `travar_processo`, `gravar_capa_legado`, `atualizar_filas_mensais`, `registrar_metadata`, `gravar` |
+| decisão | `processar` (`achar_originario` + `aplicar_honorarios`), `sufixos`, `mesmo_nome_hon`, `advogados_do_nome`, `advogado_credor`, `cpf_do_advogado_credor` |
+| gravação de um crédito | `Backup`, `id_do_software`, `filas_antigas`, `partes_para_banco`, `capa_para_banco`, `travar_processo`, `gravar_capa_legado`, `atualizar_filas_mensais`, `SQL_DOCS_CREDOR`, `sinais_do_candidato`, `originario_provavel`, `registrar_metadata`, `gravar` |
 | gravação de cada crédito | `desfazer_transacao`, `na_fila`, `marcar_falha`, `adiar_por_conflito`, `gravar_credito`, `registrar_credito` |
 | fila | `assumir_fila`, `pegar`, `devolver`, `amostra_simulacao` |
 | pausa por PJe instável | `pausa_ate`, `marcar_pausa`, `tirar_pausa`, `pje_voltou`, `reconectar_banco`, `pausar_por_instabilidade`, `pausa_de_outro`, `esperar_pausa_de_outro` |

@@ -24,7 +24,7 @@ Três modos:
         grava (COMMIT). Só roda para tribunal liberado no CPF_API/liberacao.json (escrito pelo --medir): mesma versão
         da regra, MIN_ACEITOS_LIBERAR aceitos e CPF errado até MAX_TAXA_ERRO (ver liberado()); senão sai com rc 3.
 Outras opções: --lote 50, --cache-dias 30, --renovar-cache, --so-cache (não chama a API), --refazer, --sem-espera,
---forcar.
+--forcar, --intervalo 2 (s entre chamadas à API: 2 = 30/min, para deixar metade do limite do token para a frota).
 
 Por crédito gravado, numa transação por lote (um SAVEPOINT por crédito):
   1. confere na fila (FOR UPDATE NOWAIT) que nada mudou desde a leitura e que o crédito continua sem CREDOR;
@@ -60,8 +60,8 @@ sys.path.insert(0, str(RAIZ))
 
 from utils.arquivos import anexar_csv  # noqa: E402
 from utils.banco import como_dicts, conectar, filas_antigas  # noqa: E402
-from utils.cpf_api import (REGRA_VERSAO, Cache, Cliente, ErroApi, ErroToken, Resultado, decidir,  # noqa: E402
-                           mascara_normal, mascarar, normalizar, regioes_da_uf)
+from utils.cpf_api import (INTERVALO, REGRA_VERSAO, Cache, Cliente, ErroApi, ErroToken, Resultado,  # noqa: E402
+                           decidir, mascara_normal, mascarar, normalizar, regioes_da_uf)
 from utils.legado import Backup, atualizar_filas_mensais, atualizar_tabela_antiga  # noqa: E402
 from utils.log import configurar_log  # noqa: E402
 from utils.texto import documento_valido, formatar_cnj, so_digitos  # noqa: E402
@@ -213,7 +213,8 @@ SELECT cc.credito_id, c.numero_norm, c.numero_exibicao AS precatorio, tc.codigo 
    AND {filtro}
    AND (%(creditos)s::bigint[] IS NULL OR cc.credito_id = ANY(%(creditos)s::bigint[]))
    AND (%(refazer)s OR coalesce(f.metadata->'cpf_api'->>'regra_versao', '') <> %(versao)s)
- ORDER BY cc.valor_referencia DESC NULLS LAST, cc.credito_id
+ ORDER BY coalesce(f.metadata->'lista'->>'faixa', '') IN ('PAGO', 'T3_PAGO'),     -- não pagos primeiro (TJRR, TJRJ)
+          cc.valor_referencia DESC NULLS LAST, cc.credito_id
 """
 FILTRO = {
     "SEM_CPF": ("st.codigo = 'SUCESSO_INCOMPLETO' AND cc.motivo_detalhe LIKE 'SUCESSO_SEM_CPF:%%' "
@@ -284,7 +285,8 @@ SQL_GABARITO = {("SEM_CPF", "ROBO"): SQL_GABARITO_SEM_CPF, ("PARTES", "ROBO"): S
 
 
 def ler_estoque(con, ad, creditos, refazer=False):
-    """Créditos do tribunal com o credor achado na fonte e sem CPF, do maior valor para o menor. Fora os já tentados
+    """Créditos do tribunal com o credor achado na fonte e sem CPF: os não pagos primeiro (metadata.lista.faixa do
+    robô: PAGO no TJRR, T3_PAGO no TJRJ vão para o fim), cada grupo do maior valor para o menor. Fora os já tentados
     nesta versão da regra (metadata.cpf_api.regra_versao), a não ser com refazer."""
     sql = SQL_ESTOQUE.format(filtro=FILTRO[ad.tipo], extra=EXTRA_PARTES if ad.tipo == "PARTES" else "",
                              join_tentativa=JOIN_TENTATIVA if ad.tipo == "PARTES" else "")
@@ -353,9 +355,10 @@ class Api:
     """Cliente da API com a política de erro da rodada: erro de API nunca vira resultado; 5 erros seguidos pausam 5
     min; 3 pausas ou token recusado param a rodada."""
 
-    def __init__(self, cache_dias, renovar, so_cache, parada):
+    def __init__(self, cache_dias, renovar, so_cache, parada, intervalo=INTERVALO):
         cache = Cache(SAIDA / "cache_cpf_api.jsonl", dias=cache_dias)
-        self.cliente = _ClienteSoCache(cache) if so_cache else Cliente(cache=cache)   # sem .env: ErroToken
+        # sem .env: ErroToken
+        self.cliente = _ClienteSoCache(cache) if so_cache else Cliente(cache=cache, intervalo=intervalo)
         self.renovar, self.so_cache, self.parada = renovar, so_cache, parada
         self.renovados, self.erros_seguidos, self.pausas = set(), 0, 0
 
@@ -688,7 +691,7 @@ def registrar_item(rod, item):
 def completar(ad, args, parada):
     """Simulação ou gravação de um tribunal."""
     rod = Rodada(ad, args.simulacao, args.sem_desfazer)
-    api = Api(args.cache_dias, args.renovar_cache, args.so_cache, parada)
+    api = Api(args.cache_dias, args.renovar_cache, args.so_cache, parada, args.intervalo)
     regioes = regioes_da_uf(ad.uf)
     try:
         linhas = ler_estoque(rod.leitura, ad, args.creditos, refazer=args.refazer)
@@ -749,7 +752,7 @@ def medir(ads, n, semente, args, parada):
     gravação daquele tribunal."""
     rodada = f"{datetime.now():%Y%m%d_%H%M%S}"
     leitura = conectar("completar_cpf_medir")
-    api = Api(args.cache_dias, args.renovar_cache, args.so_cache, parada)
+    api = Api(args.cache_dias, args.renovar_cache, args.so_cache, parada, args.intervalo)
     arquivo_resumo = SAIDA / "medicao_resumo.json"
     resumo = json.loads(arquivo_resumo.read_text(encoding="utf-8")) if arquivo_resumo.exists() else {}
     colunas = ["rodada", "tribunal", "credito_id", "nome", "palavras", "faixa_ano_originario", "tem_nascimento",
@@ -857,6 +860,9 @@ def ler_argumentos():
     ap.add_argument("--sem-espera", action="store_true", help="grava sem os 10 s de aviso (uso pelo modo 5)")
     ap.add_argument("--sem-desfazer", action="store_true",
                     help="não escreve o desfazer_*.sql/backup_*.csv (como os outros tribunais do modo 5 do RPA)")
+    ap.add_argument("--intervalo", type=float, default=INTERVALO,
+                    help=f"s entre chamadas à API (padrão {INTERVALO}; 2 = 30/min, metade do limite do token, que é "
+                         "dividido com a frota)")
     a = ap.parse_args()
     siglas = [s.strip().upper() for s in (a.tribunal or "").split(",") if s.strip()]
     if any(s not in ADAPTADORES for s in siglas):
@@ -867,6 +873,8 @@ def ler_argumentos():
     a.creditos = [int(x) for x in (a.creditos or "").split(",") if x.strip().isdigit()] or None
     if a.lote < 1:
         ap.error("--lote precisa ser maior que zero")
+    if a.intervalo < INTERVALO:
+        ap.error(f"--intervalo precisa ser pelo menos {INTERVALO} s (limite de 60/min do token)")
     return a
 
 

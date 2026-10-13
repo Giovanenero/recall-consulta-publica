@@ -29,6 +29,11 @@ python TJDF/fetch_TJDF.py --workers 6 --ritmo 4      # padrão: 6 threads, até 
   nelas. Reserva sem dono é solta na partida e a cada 30 min.
 - **Arquivos de desfazer:** só com `--com-desfazer`; o padrão é não escrever (`--sem-desfazer`, que os ciclos do modo
   5 passam, continua aceito).
+- **API de CPF no robô (08/10/2026, como no TJPI e no TJRJ):** credor só com nome (fora os honorários) -> o robô
+  consulta a API pelo nome (`utils/cpf_robo.py`; regra, gate `CPF_API/liberacao.json` e cache do
+  `CPF_API/completar_cpf.py`). Aceito: credor ligado com o CPF e status `SUCESSO_API_TERCEIRO`; senão fica
+  `SUCESSO_SEM_CPF` com `metadata.cpf_api`. O candidato por iniciais (`CREDOR_SO_POR_INICIAIS`, SUCESSO_ANALISAR)
+  não é consultado: o nome não foi confirmado. `--sem-cpf-api` desliga.
 - **Conexão parada:** o Postgres derruba sessão parada há mais de 15 min; depois da espera pelos adiados o robô abre
   conexões novas, e a leitura do crédito tenta de novo uma vez com conexão nova.
 - **Carga (`carregar_TJDF.py`):** decisão do usuário de 05/10/2026. Para cada precatório da tabela antiga (número de
@@ -103,10 +108,63 @@ Faixas, na ordem da fila (dentro de cada uma: prioridade de campanha, superprefe
 | Só o nome | `SUCESSO_INCOMPLETO SUCESSO_SEM_CPF` |
 | Só iniciais, pessoa sem documento confirmando | `SUCESSO_ANALISAR CREDOR_SO_POR_INICIAIS` (candidato só no metadata; decisão do usuário, como no TJMT) |
 | Várias pessoas com as iniciais / no polo ativo do precatório | `SUCESSO_ANALISAR CANDIDATOS_POR_INICIAIS` / `VARIOS_CREDORES_NO_PRECATORIO` |
-| Só sociedade de advogados no polo ativo | `SUCESSO_INCOMPLETO SUCESSO_SEM_CPF … regra=HONORARIOS_ADVOGADO` |
+| Só um advogado pessoa física no polo ativo, com CPF (DJe/PJe, ou o único documento da OAB no banco) | `SUCESSO_PROCESSO_CREDITO CREDOR_ADVOGADO … regra=HONORARIOS_ADVOGADO` (CREDOR com o CPF e ADVOGADO com a OAB; decisão do usuário de 08/10/2026, a regra do TJMA) |
+| Só sociedade de advogados no polo ativo, ou o advogado sem CPF | `SUCESSO_INCOMPLETO SUCESSO_SEM_CPF … regra=HONORARIOS_ADVOGADO` (só ADVOGADO) |
 | Ninguém identificado (1ª e 2ª vez) | volta para a fila em 60 dias (`CREDOR_NAO_IDENTIFICADO … [sem_credor=N]`) |
 | Ninguém identificado (3ª vez) | `FALHA SEM_CREDOR` |
 | Órgão público; número de outro tribunal | `FALHA` |
+
+## Originário provável (desde 08/10/2026)
+
+Quando o originário **não** é confirmado (e o crédito não é FALHA), o robô grava
+`credito_fonte.metadata.originario_provavel`: o candidato mais provável, a **confiança** (alta/media/baixa), os pontos,
+a margem para o 2º e até 5 candidatos com os sinais (escala comum dos robôs, `utils/originario_provavel.py`).
+**Decisão do usuário (08/10/2026): fica só no metadata**; não liga `credito_originario` e não muda o status. Com o
+originário confirmado a chave não existe (e sai, se existia).
+
+Entram os candidatos de `motor.candidatos` e, desde 08/10/2026, os de `motor.descartados`: processos com o credor no
+polo ativo que a regra do confirmado tira, mas podem ser o originário — polo passivo vazio no PJe ("Não definida",
+comum no Juizado da Fazenda) ou distribuído depois da apresentação. Processo contra outra parte que não o ente não
+entra. Sinais (`sinais_do_candidato`):
+
+| Sinal | No TJDFT |
+|---|---|
+| `CPF_CREDOR` | rota NOME com o CPF da certidão do DJe e a pessoa do polo com documento (o robô só a aceita com o mesmo CPF); rota INICIAIS com `CPF_DJE`; ou CPF de credor que o banco já tinha de outra origem |
+| `NOME_CREDOR` / `INICIAIS_CREDOR` | rota NOME pelo nome / rota INICIAIS |
+| `CITA_PRECATORIO` | documento do processo cita o número do precatório |
+| `ENTE_PASSIVO` | devedor no polo passivo (falta no descartado com o polo passivo vazio) |
+| `ADVOGADO_EM_COMUM` | OAB de advogado do precatório no polo ativo (guardado desde 08/10/2026; antes, inferido na rota INICIAIS) |
+| `CLASSE_CUMPRIMENTO`, `VARA_FAZENDA` | cumprimento/execução; Vara/Juizado da Fazenda Pública ou execução no próprio TJDFT (2º grau, competência originária) |
+| `ANO_ANTERIOR` / `ANO_POSTERIOR` | ano do CNJ antes do precatório (ou do mesmo ano e distribuído antes) / depois (sai) |
+
+**Data da migração (corrigido em 08/10/2026):** processo físico migrado para o PJe traz como `dataDistribuicao` a
+data da migração (ex.: 0010789-11.2008 → 2024-05-14), e o `antes_do_precatorio()` descartava o originário certo. Agora
+ele compara pela `data_do_processo()`: com o ano do número CNJ menor que o ano da `dataDistribuicao`, vale 1º/jan do
+ano do CNJ (a data gravada na capa continua a do PJe). No provável, o candidato que ainda cair como distribuído depois
+leva `data_migracao: true` e conta `ANO_ANTERIOR`. Teste (simulação, 27 físicos `CREDOR_SEM_ORIGINARIO`): os 4
+exemplos conhecidos e 2 de 20 sorteados passaram a `SUCESSO_PROCESSO_ORIGINARIO`; credor com CPF mantido em todos.
+
+Os gravados antes: `TJDF/reabrir_data_migracao.py` (`--simulacao`, `--com-desfazer`, `--disponivel-em`, `--liberar`)
+devolve para PENDENTE os físicos (`numero_norm` 00…) em `SUCESSO_PROCESSO_CREDITO CREDOR_SEM_ORIGINARIO`, com o
+prefixo `REABERTO_DATA_MIGRACAO:` no motivo; o credor ligado fica (o robô só acrescenta o originário). Rodou em
+08/10/2026 17:24: 3.581 reabertos, **segurados até 31/12/2026** (o robô antigo da RECALL-0162 repetiria o defeito);
+com o código novo em todas as máquinas, `python TJDF/reabrir_data_migracao.py --liberar`. Desfazer:
+`TJDF/saida/desfazer_reabrir_data_migracao_20261008_172402.sql`.
+
+Créditos processados antes de 08/10/2026: acertados pelo `recalcular_originario_provavel.py` (script de uma vez só, já rodado e removido do repositório). O
+`CREDOR_SEM_ORIGINARIO` antigo não tem candidato guardado (o robô não guardava os descartados): só o reprocessamento
+pelo robô o completa.
+
+## Honorários: o advogado é o credor (desde 08/10/2026)
+
+Decisão do usuário (a regra do TJMA de 07/10): precatório só com um advogado pessoa física no polo ativo -> CREDOR
+com o CPF (certidão do DJe/PJe; sem ele, o único documento da pessoa dona da OAB no banco; dígito conferido) e
+ADVOGADO com a OAB, `SUCESSO_PROCESSO_CREDITO` "CREDOR_ADVOGADO: … regra=HONORARIOS_ADVOGADO". Sem CPF, ou sociedade
+de advogados (CNPJ), fica como antes (só ADVOGADO, `SUCESSO_INCOMPLETO`).
+
+Os gravados antes: `religar_honorarios.py` (script de uma vez só, já rodado e removido do repositório). Rodou em
+08/10/2026 14:37: 1.042 religados; ficaram 215 sociedades, 169 sem CPF, 37 sem vínculo ADVOGADO com OAB do mesmo
+nome e 5 com sociedade entre os nomes do DJe. Desfazer: `TJDF/saida/desfazer_religar_honorarios_20261008_143715.sql`.
 
 ## Gravação
 
